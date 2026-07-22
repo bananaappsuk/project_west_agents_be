@@ -8,9 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
 from ..deps import require_platform_admin
-from ..models import Application, Membership, Permission, Role, User
-from ..schemas import ApplicationIn, MemberIn, PermissionIn, RoleIn
+from ..models import Application, Membership, Organization, Permission, Role, User
+from ..schemas import ApplicationIn, MemberIn, PermissionIn, ProvisionIn, RoleIn
 from ..security import hash_password
+from .auth import _ensure_permissions, _slug
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_platform_admin)])
 
@@ -90,3 +91,54 @@ async def add_member(body: MemberIn, session: AsyncSession = Depends(get_session
         membership.roles = roles
     await session.commit()
     return {"membership_id": membership.id, "roles": [r.name for r in roles]}
+
+
+@router.post("/provision", status_code=status.HTTP_201_CREATED)
+async def provision_org(body: ProvisionIn, session: AsyncSession = Depends(get_session)):
+    """Create a new org + owner membership for an application in one call.
+
+    This is the "sell one app to an org" operation: the org gets access to exactly
+    this app (owner role, app-scoped permissions) and nothing else. The billing
+    Subscription for the org is created separately in the Billing service.
+    """
+    app = await session.scalar(select(Application).where(Application.key == body.app_key))
+    if app is None:
+        app = Application(key=body.app_key, name=body.app_key)
+        session.add(app)
+        await session.flush()
+
+    keys = body.permission_keys or [
+        f"{app.key}:admin",
+        f"{app.key}:agent.invoke",
+        f"{app.key}:emails.read",
+        f"{app.key}:emails.write",
+    ]
+    perms = await _ensure_permissions(session, app, keys)
+
+    org = Organization(name=body.org_name, slug=_slug(body.org_name))
+    session.add(org)
+    await session.flush()
+
+    role = Role(name="owner", app_id=app.id, org_id=org.id, permissions=perms)
+    session.add(role)
+    await session.flush()
+
+    user = await session.scalar(select(User).where(User.email == body.email))
+    if not user:
+        if not body.password:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "password required to create a new user")
+        user = User(email=body.email, password_hash=hash_password(body.password), full_name=body.full_name)
+        session.add(user)
+        await session.flush()
+
+    membership = Membership(user_id=user.id, org_id=org.id, app_id=app.id, roles=[role])
+    session.add(membership)
+    await session.commit()
+    return {
+        "org_id": org.id,
+        "user_id": user.id,
+        "membership_id": membership.id,
+        "app_key": app.key,
+        "roles": ["owner"],
+        "scope": sorted(p.key for p in perms),
+    }
