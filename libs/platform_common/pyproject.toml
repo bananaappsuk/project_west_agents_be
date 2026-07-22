@@ -1,0 +1,19 @@
+[project]
+name = "platform-common"
+version = "0.1.0"
+description = "Shared platform library: token verification, scope checks, config, db helpers."
+requires-python = ">=3.10"
+dependencies = [
+    "pyjwt[crypto]>=2.8",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "fastapi>=0.110",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["platform_common*"]
