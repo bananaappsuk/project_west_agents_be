@@ -1,0 +1,16 @@
+from platform_common.config import BaseServiceSettings
+
+
+class Settings(BaseServiceSettings):
+    service_name: str = "gateway"
+
+    # Upstream services
+    auth_url: str = "http://localhost:8001"
+    west_agent_url: str = "http://localhost:8010"
+    agent_factory_url: str = "http://localhost:8002"
+
+    # Browser origin allowed by CORS (the Next.js frontend). Comma-separated for several.
+    frontend_origin: str = "http://localhost:3000"
+
+
+settings = Settings()
