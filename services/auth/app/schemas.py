@@ -60,3 +60,14 @@ class MemberIn(BaseModel):
     org_id: str
     app_key: str
     role_names: list[str] = []
+
+
+class ProvisionIn(BaseModel):
+    """Create a new org + owner for an application in one call (the "sell one app" flow)."""
+
+    email: EmailStr
+    password: str | None = None   # required if the user does not yet exist
+    full_name: str | None = None
+    org_name: str
+    app_key: str
+    permission_keys: list[str] = []  # defaults to a sensible owner set if empty
