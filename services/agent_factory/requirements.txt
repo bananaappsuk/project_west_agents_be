@@ -1,0 +1,10 @@
+-e ../../libs/platform_common
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Agent runtime (added when the first real agent is ported):
+# langchain>=0.3
+# langgraph>=0.2
+# langchain-anthropic>=0.3
+# langchain-postgres>=0.0.12
+# psycopg[binary]>=3.1
