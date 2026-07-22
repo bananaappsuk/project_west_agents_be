@@ -50,6 +50,15 @@ class Auth:
         token = authorization.split(" ", 1)[1].strip()
         return self._decode(token)
 
+    async def current_org(self, authorization: str | None = Header(default=None)) -> str:
+        """FastAPI dependency: the tenant id from the token. Every tenant-scoped
+        query in an app service should filter by this value."""
+        claims = await self.claims(authorization)
+        org = claims.get("org")
+        if not org:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "token carries no org")
+        return org
+
     def require_scope(self, *needed: str):
         """FastAPI dependency factory: require the token to carry all given scopes."""
 
