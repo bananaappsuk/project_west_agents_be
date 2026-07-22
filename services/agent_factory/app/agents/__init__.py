@@ -1,9 +1,6 @@
-"""Register agents here.
+"""Register agents here — each application's agents load at startup.
 
-Each application's agents live in a subpackage (e.g. west_agent/, rekroot/) and
-register themselves via @register. Import them here so they load at startup:
-
-    # from . import west_agent  # noqa: F401
-
-No agents are wired yet — the first one is added in the agent-porting phase.
+Adding a new agent = a new module under this package + an import line here.
 """
+
+from . import west_agent  # noqa: F401  (registers west-agent.mail)
