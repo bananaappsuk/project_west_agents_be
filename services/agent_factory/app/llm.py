@@ -37,7 +37,8 @@ def _analyze_llm(email: dict) -> MailAnalysis:
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_openai import ChatOpenAI
 
-    llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0)
+    # No temperature pinned — some reasoning models (gpt-5.x, o-series) reject non-default values.
+    llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key)
     analyzer = llm.with_structured_output(MailAnalysis)
     system = (
         "You triage inbound customer email. Produce a one-line summary, a category "
