@@ -10,11 +10,18 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+import logging
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from platform_common import configure_logging
+
 from .config import settings
+
+configure_logging("gateway")
+log = logging.getLogger("gateway")
 
 # Longest-prefix-first routing table.
 ROUTES: list[tuple[str, str]] = sorted(
@@ -95,8 +102,10 @@ async def proxy(path: str, request: Request):
             headers=fwd_headers,
         )
     except httpx.RequestError as exc:
+        log.warning("%s /%s -> %s UNREACHABLE: %s", request.method, path, upstream, exc)
         raise HTTPException(status_code=502, detail=f"upstream unreachable: {exc}") from exc
 
+    log.info("%s /%s -> %s [%d]", request.method, path, upstream, upstream_resp.status_code)
     resp_headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP}
     return Response(
         content=upstream_resp.content,
