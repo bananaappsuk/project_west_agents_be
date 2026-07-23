@@ -1,17 +1,25 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from .db import engine
-from .models import Base
-from .routers import admin, auth, common, health, wellknown
+from platform_common import configure_logging
+
+configure_logging("auth")
+log = logging.getLogger("auth")
+
+from .db import engine  # noqa: E402
+from .models import Base  # noqa: E402
+from .routers import admin, auth, common, health, wellknown  # noqa: E402
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # MVP: auto-create tables. Replace with Alembic migrations later.
+    log.info("starting auth: creating tables…")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    log.info("auth ready")
     yield
     await engine.dispose()
 
