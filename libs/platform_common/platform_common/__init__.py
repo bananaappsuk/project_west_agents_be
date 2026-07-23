@@ -7,6 +7,7 @@ Exposes:
 """
 
 from .config import BaseServiceSettings
+from .logging import configure_logging
 from .security import Auth
 
-__all__ = ["BaseServiceSettings", "Auth"]
+__all__ = ["BaseServiceSettings", "Auth", "configure_logging"]

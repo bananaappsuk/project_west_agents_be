@@ -19,6 +19,9 @@ def make_db(database_url: str):
         #   transaction-mode) endpoint; harmless on the direct endpoint.
         connect_args = {"ssl": True, "statement_cache_size": 0}
 
-    engine = create_async_engine(database_url, connect_args=connect_args, pool_pre_ping=True)
+    # pool_recycle instead of pool_pre_ping: pre_ping adds a round-trip on every
+    # checkout (painful on a high-latency link); recycling before Neon's ~5-min
+    # idle cutoff keeps connections healthy without that per-request cost.
+    engine = create_async_engine(database_url, connect_args=connect_args, pool_recycle=280)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return engine, session_factory
