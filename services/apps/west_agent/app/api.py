@@ -61,12 +61,17 @@ async def fetch_emails(
     count: int = 20, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)
 ):
     try:
-        new = await pipeline.fetch_and_process(session, _org(claims), count)
+        new_ids = await pipeline.fetch_and_process(_org(claims), count)
     except LookupError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"mailbox fetch failed: {exc}") from exc
-    return [serialize_email(e) for e in new]
+    if not new_ids:
+        return []
+    rows = await session.scalars(
+        select(Email).where(Email.id.in_(new_ids)).order_by(Email.received_at.desc())
+    )
+    return [serialize_email(e) for e in rows]
 
 
 @router.post("/emails/move", status_code=status.HTTP_204_NO_CONTENT)
@@ -274,11 +279,28 @@ async def update_agent_config(body: AgentConfigIn, claims: dict = Depends(requir
 
 
 # ---------- mailbox settings ----------
+@router.get("/settings/mailbox")
+async def get_mailbox(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
+    """Non-secret mailbox settings for prefilling the form. Password is never returned."""
+    mb = await session.scalar(select(Mailbox).where(Mailbox.org_id == _org(claims)))
+    if not mb:
+        return None
+    return {
+        "imapHost": mb.imap_host,
+        "imapPort": mb.imap_port,
+        "smtpHost": mb.smtp_host,
+        "smtpPort": mb.smtp_port,
+        "username": mb.username,
+        "enabled": mb.enabled,
+        "configured": True,
+    }
+
+
 @router.post("/settings/mailbox")
 async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
     org = _org(claims)
     mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == org))
-    enc = crypto.encrypt(body.password)
+    enc = crypto.encrypt(body.password.replace(" ", ""))  # app passwords are shown spaced; store without
     if mailbox:
         mailbox.imap_host, mailbox.imap_port = body.imapHost, body.imapPort
         mailbox.smtp_host, mailbox.smtp_port = body.smtpHost, body.smtpPort
@@ -299,7 +321,7 @@ async def test_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE))):
         await run_in_threadpool(
             mail_client.test_connection,
             imap_host=body.imapHost, imap_port=body.imapPort,
-            username=body.username, password=body.password,
+            username=body.username, password=body.password.replace(" ", ""),
         )
     except Exception as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"connection failed: {exc}") from exc
