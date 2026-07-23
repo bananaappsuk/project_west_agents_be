@@ -1,10 +1,14 @@
+import logging
 import uuid
 
 from fastapi import FastAPI, Header, HTTPException, status
 
-from platform_common import Auth
+from platform_common import Auth, configure_logging
 
-from . import agents  # noqa: F401  (imports register agents)
+configure_logging("agent_factory")
+log = logging.getLogger("agent_factory")
+
+from . import agents  # noqa: E402,F401  (imports register agents)
 from .config import settings
 from .registry import REGISTRY
 from .runtime import get_agent
@@ -12,6 +16,7 @@ from .runtime import get_agent
 auth = Auth(jwks_url=settings.auth_jwks_url, issuer=settings.auth_issuer)
 
 app = FastAPI(title="Agent Factory", version="0.1.0")
+log.info("agent factory ready — registered agents: %s", sorted(REGISTRY.keys()))
 
 
 @app.get("/health")
@@ -42,15 +47,21 @@ async def invoke(
 
     agent = get_agent(f"{app_key}.{agent_key}")
     if agent is None:
+        log.warning("invoke: agent %s.%s not found", app_key, agent_key)
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
 
     # payload = {"email": {...}, "thread_id": "..."} (thread_id optional)
     email = payload.get("email", payload)
     thread_id = payload.get("thread_id") or f"{app_key}.{agent_key}:{uuid.uuid4()}"
+    log.info("invoke %s.%s (trusted=%s) subject=%r", app_key, agent_key, trusted, (email or {}).get("subject"))
 
     try:
         result = await agent.ainvoke({"email": email}, config={"configurable": {"thread_id": thread_id}})
     except Exception as exc:  # surface LLM/graph errors clearly (e.g. bad API key)
+        log.exception("invoke %s.%s FAILED", app_key, agent_key)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"agent error: {exc}") from exc
 
+    analysis = result.get("analysis") or {}
+    log.info("invoke %s.%s -> %s/%s (escalate=%s)", app_key, agent_key,
+             analysis.get("category"), analysis.get("priority"), result.get("escalate"))
     return {"analysis": result.get("analysis"), "escalate": result.get("escalate")}
