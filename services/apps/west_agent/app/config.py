@@ -10,8 +10,8 @@ class Settings(BaseServiceSettings):
     agent_factory_url: str = "http://localhost:8002"
     agent_factory_internal_key: str | None = None
 
-    cron_enabled: bool = False
-    cron_interval_minutes: int = 60
+    cron_enabled: bool = True     # master switch for the background scheduler
+    cron_tick_minutes: int = 5    # how often the scheduler checks each org's schedule
     fetch_per_run: int = 20
 
 
