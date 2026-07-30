@@ -44,7 +44,7 @@ async def _get_email(session: AsyncSession, org: str, email_id: str) -> Email:
 # ---------- health ----------
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "west_agent"}
+    return {"status": "ok", "service": "mail_agent"}
 
 
 # ---------- emails ----------

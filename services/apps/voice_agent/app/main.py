@@ -6,8 +6,8 @@ from fastapi import FastAPI
 
 from platform_common import configure_logging
 
-configure_logging("west_agent")
-log = logging.getLogger("west_agent")
+configure_logging("voice_agent")
+log = logging.getLogger("voice_agent")
 
 from . import api, scheduler  # noqa: E402  (import after logging is configured)
 from .db import engine
@@ -30,14 +30,21 @@ async def _init_db(retries: int = 6, delay: float = 2.0) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("starting west-agent: creating tables…")
+    log.info("starting voice-agent: creating tables…")
     await _init_db()
     scheduler.start()
-    log.info("west-agent ready")
+    log.info("voice-agent ready")
     yield
     scheduler.stop()
     await engine.dispose()
 
 
-app = FastAPI(title="west-agent", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="voice-agent", version="0.1.0", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "voice_agent"}
+
+
 app.include_router(api.router)

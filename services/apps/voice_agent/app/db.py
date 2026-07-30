@@ -3,7 +3,7 @@ from platform_common.db import make_db
 from .config import settings
 
 if not settings.database_url:
-    raise RuntimeError("DATABASE_URL is required for the west-agent service")
+    raise RuntimeError("DATABASE_URL is required for the voice-agent service")
 
 engine, SessionLocal = make_db(settings.database_url)
 

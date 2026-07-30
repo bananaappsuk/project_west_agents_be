@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _id() -> str:
+    return str(uuid.uuid4())
+
+
+class Recording(Base):
+    __tablename__ = "recordings"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    ext_id: Mapped[str] = mapped_column(String)  # BT Cloud recording id — dedup key within an org
+    caller: Mapped[str] = mapped_column(String, default="")
+    phone: Mapped[str] = mapped_column(String, default="")
+    agent: Mapped[str] = mapped_column(String, default="")
+    call_date: Mapped[str] = mapped_column(String, default="")   # YYYY-MM-DD (frontend renders as-is)
+    duration: Mapped[str] = mapped_column(String, default="")    # "M:SS"
+    transcript: Mapped[str] = mapped_column(Text, default="")
+    # AI fields (filled by the Agent Factory voice agent)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String, default="General Enquiry")
+    priority: Mapped[str] = mapped_column(String, default="Medium")     # High | Medium | Low
+    risk: Mapped[str] = mapped_column(String, default="Low")            # High | Medium | Low
+    sentiment: Mapped[str] = mapped_column(String, default="Neutral")   # Positive | Neutral | Negative
+    needs_reply: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_reply: Mapped[str] = mapped_column(Text, default="")
+    reply_status: Mapped[str] = mapped_column(String, default="none")   # none|pending|edited|approved|sent|rejected
+    analysis_status: Mapped[str] = mapped_column(String, default="pending")  # pending|done|failed
+    # new = latest cron extraction; old = swept by a later run
+    status: Mapped[str] = mapped_column(String, default="new", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (UniqueConstraint("org_id", "ext_id", name="uq_recording_org_ext"),)
+
+
+class VoiceSettings(Base):
+    __tablename__ = "voice_settings"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
+    org_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    endpoint: Mapped[str] = mapped_column(String, default="")  # RingCentral/BT Cloud Work server URL
+    client_id: Mapped[str] = mapped_column(String, default="")
+    client_secret_enc: Mapped[str] = mapped_column(Text, default="")
+    jwt_enc: Mapped[str] = mapped_column(Text, default="")  # RingCentral JWT credential (server-to-server auth)
+    cron_frequency: Mapped[str] = mapped_column(String, default="every6h")  # hourly|every6h|daily
+    cron_time: Mapped[str] = mapped_column(String, default="02:00")         # HH:mm (daily only)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Notification(Base):
+    __tablename__ = "voice_notifications"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentRun(Base):
+    __tablename__ = "voice_agent_runs"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
+    org_id: Mapped[str] = mapped_column(String, index=True)
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    fetched: Mapped[int] = mapped_column(Integer, default=0)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    high_risk: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String, default="success")  # success|partial|failed

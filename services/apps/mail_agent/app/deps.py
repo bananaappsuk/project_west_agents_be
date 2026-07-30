@@ -4,7 +4,7 @@ from platform_common import Auth
 
 from .config import settings
 
-# audience = app_key: only west-agent tokens are accepted here.
+# audience = app_key: only mail-agent tokens are accepted here.
 auth = Auth(jwks_url=settings.auth_jwks_url, issuer=settings.auth_issuer, audience=settings.app_key)
 
 

@@ -18,7 +18,7 @@ from .db import SessionLocal
 from .models import AgentRun, Email, Mailbox
 from .schemas import serialize_email
 
-log = logging.getLogger("west_agent.pipeline")
+log = logging.getLogger("mail_agent.pipeline")
 
 
 async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:

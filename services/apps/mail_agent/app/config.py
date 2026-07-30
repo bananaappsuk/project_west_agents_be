@@ -2,8 +2,8 @@ from platform_common.config import BaseServiceSettings
 
 
 class Settings(BaseServiceSettings):
-    service_name: str = "west_agent"
-    app_key: str = "west-agent"  # token audience this service accepts
+    service_name: str = "mail_agent"
+    app_key: str = "mail-agent"  # token audience this service accepts
 
     encryption_key: str | None = None  # Fernet key for mailbox passwords
 

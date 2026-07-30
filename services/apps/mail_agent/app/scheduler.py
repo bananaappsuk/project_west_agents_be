@@ -19,7 +19,7 @@ from .config import settings
 from .db import SessionLocal
 from .models import AgentConfig, AgentRun, Mailbox
 
-log = logging.getLogger("west_agent.scheduler")
+log = logging.getLogger("mail_agent.scheduler")
 scheduler = AsyncIOScheduler()
 _running: set[str] = set()  # org_ids with a run in flight — prevents tick pileup
 
