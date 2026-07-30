@@ -1,4 +1,4 @@
-"""west-agent mail agent — native LangGraph.
+"""mail-agent mail agent — native LangGraph.
 
 Given one inbound email, produce {summary, category, priority, confidence} and flag
 escalation when confidence is low. Single-turn today; runs on the same StateGraph +
@@ -35,7 +35,7 @@ def _guardrail(state: MailState) -> dict:
 
 @register
 class MailAgent(BaseAgent):
-    app = "west-agent"
+    app = "mail-agent"
     key = "mail"
 
     def build(self):
