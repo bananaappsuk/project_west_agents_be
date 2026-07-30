@@ -10,7 +10,7 @@ log = logging.getLogger("auth")
 
 from .db import engine  # noqa: E402
 from .models import Base  # noqa: E402
-from .routers import admin, auth, common, health, wellknown  # noqa: E402
+from .routers import admin, auth, common, health, orgs, wellknown  # noqa: E402
 
 
 @asynccontextmanager
@@ -26,5 +26,5 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Auth Service", version="0.1.0", lifespan=lifespan)
 
-for router in (health.router, wellknown.router, auth.router, admin.router, common.router):
+for router in (health.router, wellknown.router, auth.router, admin.router, common.router, orgs.router):
     app.include_router(router)

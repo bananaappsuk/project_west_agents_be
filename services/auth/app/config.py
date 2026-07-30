@@ -12,5 +12,18 @@ class Settings(BaseServiceSettings):
 
     bootstrap_enabled: bool = True       # allow self-serve signup via /auth/register
 
+    # Invite email delivery (optional). If SMTP_HOST is unset, invites are created but
+    # not emailed — the inviter shares the one-time link manually instead.
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str = "Project West Agent <no-reply@localhost>"
+    smtp_starttls: bool = True
+
+    @property
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_host)
+
 
 settings = Settings()

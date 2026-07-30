@@ -11,8 +11,8 @@ from sqlalchemy.orm import selectinload
 from ..config import settings
 from ..db import get_session
 from ..deps import current_claims
-from ..models import Application, Membership, Organization, Permission, RefreshToken, Role, User
-from ..schemas import LoginIn, LogoutIn, RefreshIn, RegisterIn, TokenOut
+from ..models import Application, Invite, Membership, Organization, Permission, RefreshToken, Role, User
+from ..schemas import AcceptInviteIn, LoginIn, LogoutIn, RefreshIn, RegisterIn, TokenOut
 from ..security import (
     create_access_token,
     hash_password,
@@ -160,6 +160,40 @@ async def refresh(body: RefreshIn, session: AsyncSession = Depends(get_session))
     return await _issue_tokens(session, user=user, org_id=rt.org_id, app=app, roles=roles, scope=scope)
 
 
+@router.post("/accept-invite", response_model=TokenOut)
+async def accept_invite(body: AcceptInviteIn, session: AsyncSession = Depends(get_session)):
+    """Public: an invited teammate sets their password and is signed in.
+
+    Verifies the one-time invite token, activates the user, and issues tokens for the
+    org + app the invite was for.
+    """
+    inv = await session.scalar(select(Invite).where(Invite.token_hash == hash_token(body.token)))
+    if not inv or inv.accepted or inv.expires_at <= _utcnow():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired invite")
+
+    user = await session.get(User, inv.user_id)
+    app = await session.get(Application, inv.app_id)
+    if not user or not app:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "invite target not found")
+
+    user.password_hash = hash_password(body.password)
+    if body.full_name:
+        user.full_name = body.full_name
+    user.is_active = True
+    inv.accepted = True
+
+    membership = await session.scalar(
+        select(Membership)
+        .where(Membership.user_id == user.id, Membership.org_id == inv.org_id, Membership.app_id == inv.app_id)
+        .options(selectinload(Membership.roles).selectinload(Role.permissions))
+    )
+    if not membership:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "membership was revoked")
+
+    roles, scope = _token_fields(app.key, membership)
+    return await _issue_tokens(session, user=user, org_id=inv.org_id, app=app, roles=roles, scope=scope)
+
+
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(body: LogoutIn, session: AsyncSession = Depends(get_session)):
     rt = await session.scalar(select(RefreshToken).where(RefreshToken.token_hash == hash_token(body.refresh_token)))
@@ -174,11 +208,13 @@ async def me(claims: dict = Depends(current_claims), session: AsyncSession = Dep
     user = await session.get(User, claims["sub"])
     if not user:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    org = await session.get(Organization, claims["org"]) if claims.get("org") else None
     return {
         "id": user.id,
         "email": user.email,
         "full_name": user.full_name,
         "org": claims.get("org"),
+        "org_name": org.name if org else None,
         "app": claims.get("aud"),
         "roles": claims.get("roles"),
         "scope": claims.get("scope"),

@@ -30,6 +30,12 @@ class RefreshIn(BaseModel):
     refresh_token: str
 
 
+class AcceptInviteIn(BaseModel):
+    token: str
+    password: str = Field(min_length=8)
+    full_name: str | None = None
+
+
 class LogoutIn(BaseModel):
     refresh_token: str
 
