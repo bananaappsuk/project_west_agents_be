@@ -30,11 +30,13 @@ ROUTES: list[tuple[str, str]] = sorted(
         ("/.well-known", settings.auth_url),
         ("/admin", settings.auth_url),
         ("/common", settings.auth_url),
-        ("/emails", settings.west_agent_url),
-        ("/folders", settings.west_agent_url),
-        ("/alerts", settings.west_agent_url),
-        ("/settings", settings.west_agent_url),
-        ("/agent/", settings.west_agent_url),   # /agent/status
+        ("/orgs", settings.auth_url),
+        ("/emails", settings.mail_agent_url),
+        ("/folders", settings.mail_agent_url),
+        ("/alerts", settings.mail_agent_url),
+        ("/settings", settings.mail_agent_url),
+        ("/agent/", settings.mail_agent_url),   # /agent/status
+        ("/voice", settings.voice_agent_url),   # all voice-agent endpoints: /voice/recordings, /voice/settings, …
         ("/agents", settings.agent_factory_url),  # /agents/{app}/{key}/invoke
     ],
     key=lambda kv: len(kv[0]),
