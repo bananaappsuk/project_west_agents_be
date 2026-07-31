@@ -6,8 +6,8 @@ class Settings(BaseServiceSettings):
 
     # Upstream services
     auth_url: str = "http://localhost:8001"
-    mail_agent_url: str = "http://localhost:8010"
-    voice_agent_url: str = "http://localhost:8011"
+    mail_agent_url: str = "http://localhost:8012"
+    voice_agent_url: str = "http://localhost:8013"
     agent_factory_url: str = "http://localhost:8002"
 
     # Browser origin allowed by CORS (the Next.js frontend). Comma-separated for several.
