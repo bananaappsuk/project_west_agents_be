@@ -56,7 +56,11 @@ _client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client
-    _client = httpx.AsyncClient(timeout=60.0)
+    # A bulk voice-recording sync (list + download + transcribe several files) can
+    # legitimately take a few minutes — 60s was cutting those off mid-flight
+    # (observed: gateway timing out and returning 502 before voice_agent had even
+    # written its first row). Long enough to cover that, still a bounded ceiling.
+    _client = httpx.AsyncClient(timeout=300.0)
     yield
     await _client.aclose()
 
