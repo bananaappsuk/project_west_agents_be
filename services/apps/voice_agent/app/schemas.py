@@ -16,10 +16,20 @@ class ReplyDraftIn(BaseModel):
 
 
 class SettingsIn(BaseModel):
-    endpoint: str
-    clientId: str
+    sourceType: str = "bt_cloud"     # "bt_cloud" | "s3" — which fields below are in play
+    # BT Cloud (RingCentral)
+    endpoint: str = ""
+    clientId: str = ""
     clientSecret: str = ""
     jwt: str = ""                    # RingCentral JWT credential (blank = keep stored)
+    # S3-compatible bucket (AWS S3, Backblaze B2, MinIO, …)
+    s3Endpoint: str = ""             # blank = AWS default; set for Backblaze B2/other
+    s3Region: str = ""
+    s3Bucket: str = ""
+    s3Prefix: str = ""               # optional folder path within the bucket
+    s3AccessKeyId: str = ""
+    s3SecretAccessKey: str = ""      # blank = keep stored
+    # shared
     cronFrequency: str = "every6h"  # hourly | every6h | daily
     cronTime: str = "02:00"
     enabled: bool = True
@@ -45,6 +55,7 @@ def serialize_recording(r: Recording) -> dict:
         "transcript": r.transcript,
         "aiReply": r.ai_reply,
         "analysisStatus": r.analysis_status,
+        "audioAvailable": r.source_type == "s3",
     }
 
 
