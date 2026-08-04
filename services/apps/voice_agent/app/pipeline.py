@@ -13,7 +13,7 @@ import logging
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 
-from . import agent_client, bt_client, crypto
+from . import agent_client, bt_client, crypto, s3_client
 from .db import SessionLocal
 from .models import AgentRun, Notification, Recording, VoiceSettings
 
@@ -24,22 +24,35 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
     """Returns the ids of newly-fetched recordings."""
     log.info("fetch start: org=%s count=%d sweep=%s", org_id, count, sweep)
 
-    # 1) short txn: read BT Cloud creds
+    # 1) short txn: read the org's connection settings for whichever source is active
     async with SessionLocal() as s:
         cfg = await s.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org_id))
         if not cfg or not cfg.enabled:
-            log.warning("fetch aborted: org=%s has no enabled BT Cloud connection", org_id)
-            raise LookupError("no BT Cloud connection configured for this org")
-        creds = {
-            "endpoint": cfg.endpoint,
-            "client_id": cfg.client_id,
-            "client_secret": crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
-            "jwt": crypto.decrypt(cfg.jwt_enc) if cfg.jwt_enc else "",
-        }
+            log.warning("fetch aborted: org=%s has no enabled recording source connection", org_id)
+            raise LookupError("no recording source configured for this org")
+        source_type = cfg.source_type
+        if source_type == "s3":
+            fetch_fn = s3_client.fetch_latest
+            creds = {
+                "endpoint": cfg.s3_endpoint,
+                "region": cfg.s3_region,
+                "bucket": cfg.s3_bucket,
+                "prefix": cfg.s3_prefix,
+                "access_key_id": cfg.s3_access_key_id,
+                "secret_access_key": crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
+            }
+        else:
+            fetch_fn = bt_client.fetch_latest
+            creds = {
+                "endpoint": cfg.endpoint,
+                "client_id": cfg.client_id,
+                "client_secret": crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
+                "jwt": crypto.decrypt(cfg.jwt_enc) if cfg.jwt_enc else "",
+            }
 
-    # 2) BT Cloud fetch — NO DB connection held
-    recordings = await run_in_threadpool(bt_client.fetch_latest, count, **creds)
-    log.info("fetch: pulled %d recording(s) from BT Cloud", len(recordings))
+    # 2) fetch from the source — NO DB connection held
+    recordings = await run_in_threadpool(fetch_fn, count, **creds)
+    log.info("fetch: pulled %d recording(s) via %s", len(recordings), source_type)
 
     # 3) short txn: sweep prior 'new' -> 'old', dedup + insert pending
     new: list[tuple[str, dict]] = []
@@ -56,7 +69,7 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
             if await s.scalar(select(Recording).where(Recording.org_id == org_id, Recording.ext_id == m["ext_id"])):
                 continue  # dedup
             row = Recording(
-                org_id=org_id, ext_id=m["ext_id"], caller=m["caller"], phone=m["phone"],
+                org_id=org_id, ext_id=m["ext_id"], source_type=source_type, caller=m["caller"], phone=m["phone"],
                 agent=m["agent"], call_date=m["date"], duration=m["duration"],
                 transcript=m["transcript"], status="new", analysis_status="pending",
             )
@@ -110,7 +123,8 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
             high_risk=high, status="success" if all_ok else "partial",
         ))
         if new:
-            s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from BT Cloud"))
+            source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
+            s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
         await s.commit()
     log.info("run recorded: org=%s fetched=%d processed=%d high_risk=%d", org_id, len(recordings), len(new), high)
     return [rid for rid, _ in new]
