@@ -12,6 +12,7 @@ from .config import settings
 from .db import get_session
 from .deps import require
 from .models import AgentConfig, AgentRun, Email, Folder, Mailbox
+from .scheduler import _interval_minutes
 from .schemas import (
     AgentConfigIn,
     FolderIn,
@@ -244,7 +245,7 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
 
     next_run = ""
     if cfg.enabled and last:
-        next_run = (last.run_at + timedelta(minutes=settings.cron_interval_minutes)).isoformat()
+        next_run = (last.run_at + timedelta(minutes=_interval_minutes(cfg.cron_interval))).isoformat()
 
     return {
         "config": {"cronInterval": cfg.cron_interval, "fetchPerRun": cfg.fetch_per_run, "enabled": cfg.enabled},
