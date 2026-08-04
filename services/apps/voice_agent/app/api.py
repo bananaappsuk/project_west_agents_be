@@ -7,7 +7,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import bt_client, crypto, pipeline
+from . import bt_client, crypto, pipeline, s3_client
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -78,6 +78,32 @@ async def get_recording(rec_id: str, claims: dict = Depends(require(READ)), sess
     return serialize_recording(await _get_recording(session, _org(claims), rec_id))
 
 
+@router.get("/recordings/{rec_id}/audio")
+async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
+    """Re-fetches the recording's audio from the bucket on demand — nothing is
+    stored locally (see pipeline.py: audio is discarded right after transcription).
+    Only S3-sourced recordings have anything to serve; BT Cloud's content URL needs
+    a short-lived RingCentral token we never retain, so those 404 here."""
+    org = _org(claims)
+    r = await _get_recording(session, org, rec_id)
+    if r.source_type != "s3":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
+    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    if not cfg or not cfg.s3_bucket:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured for this org")
+    try:
+        audio, content_type = await run_in_threadpool(
+            s3_client.download,
+            endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
+            access_key_id=cfg.s3_access_key_id,
+            secret_access_key=crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
+            key=r.ext_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
+    return Response(content=audio, media_type=content_type)
+
+
 # ---------- human-in-the-loop reply ----------
 @router.post("/recordings/{rec_id}/reply/draft")
 async def save_reply_draft(rec_id: str, body: ReplyDraftIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
@@ -141,20 +167,30 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
     }
 
 
-# ---------- settings (BT Cloud connection + cron) ----------
+# ---------- settings (recording source connection + cron) ----------
 @router.get("/settings")
 async def get_settings(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    """Non-secret settings for prefilling the form. Secret is never returned."""
+    """Non-secret settings for prefilling the form. Secrets are never returned. Both source
+    field sets are always returned — the org may have one configured but currently be pointed
+    at the other, and the form shouldn't lose it when the admin isn't looking at that tab."""
     cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == _org(claims)))
     if not cfg:
         return None
     return {
+        "sourceType": cfg.source_type,
         "endpoint": cfg.endpoint,
         "clientId": cfg.client_id,
         "clientSecret": "",  # redacted
         "jwt": "",           # redacted
         "secretConfigured": bool(cfg.client_secret_enc),
         "jwtConfigured": bool(cfg.jwt_enc),
+        "s3Endpoint": cfg.s3_endpoint,
+        "s3Region": cfg.s3_region,
+        "s3Bucket": cfg.s3_bucket,
+        "s3Prefix": cfg.s3_prefix,
+        "s3AccessKeyId": cfg.s3_access_key_id,
+        "s3SecretAccessKey": "",  # redacted
+        "s3SecretConfigured": bool(cfg.s3_secret_access_key_enc),
         "cronFrequency": cfg.cron_frequency,
         "cronTime": cfg.cron_time,
         "enabled": cfg.enabled,
@@ -166,15 +202,22 @@ async def get_settings(claims: dict = Depends(require(READ)), session: AsyncSess
 async def save_settings(body: SettingsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
     org = _org(claims)
     cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
-    # Blank secret / jwt on save means "keep the stored one".
+    # Blank secret / jwt / s3 secret on save means "keep the stored one".
     enc = crypto.encrypt(body.clientSecret) if body.clientSecret else (cfg.client_secret_enc if cfg else "")
     jwt_enc = crypto.encrypt(body.jwt) if body.jwt else (cfg.jwt_enc if cfg else "")
+    s3_secret_enc = crypto.encrypt(body.s3SecretAccessKey) if body.s3SecretAccessKey else (cfg.s3_secret_access_key_enc if cfg else "")
     if cfg:
+        cfg.source_type = body.sourceType
         cfg.endpoint, cfg.client_id, cfg.client_secret_enc, cfg.jwt_enc = body.endpoint, body.clientId, enc, jwt_enc
+        cfg.s3_endpoint, cfg.s3_region, cfg.s3_bucket = body.s3Endpoint, body.s3Region, body.s3Bucket
+        cfg.s3_prefix, cfg.s3_access_key_id, cfg.s3_secret_access_key_enc = body.s3Prefix, body.s3AccessKeyId, s3_secret_enc
         cfg.cron_frequency, cfg.cron_time, cfg.enabled = body.cronFrequency, body.cronTime, body.enabled
     else:
         session.add(VoiceSettings(
-            org_id=org, endpoint=body.endpoint, client_id=body.clientId, client_secret_enc=enc, jwt_enc=jwt_enc,
+            org_id=org, source_type=body.sourceType,
+            endpoint=body.endpoint, client_id=body.clientId, client_secret_enc=enc, jwt_enc=jwt_enc,
+            s3_endpoint=body.s3Endpoint, s3_region=body.s3Region, s3_bucket=body.s3Bucket,
+            s3_prefix=body.s3Prefix, s3_access_key_id=body.s3AccessKeyId, s3_secret_access_key_enc=s3_secret_enc,
             cron_frequency=body.cronFrequency, cron_time=body.cronTime, enabled=body.enabled,
         ))
     await session.commit()
@@ -184,15 +227,23 @@ async def save_settings(body: SettingsIn, claims: dict = Depends(require(WRITE))
 @router.post("/settings/test")
 async def test_settings(body: SettingsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
     cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == _org(claims)))
-    secret = body.clientSecret or (crypto.decrypt(cfg.client_secret_enc) if (cfg and cfg.client_secret_enc) else "")
-    jwt = body.jwt or (crypto.decrypt(cfg.jwt_enc) if (cfg and cfg.jwt_enc) else "")
     try:
-        # With a JWT this performs a real RingCentral/BT Cloud Work auth; without one it
-        # just validates the fields (demo mode).
-        mode = await run_in_threadpool(
-            bt_client.test_connection,
-            endpoint=body.endpoint, client_id=body.clientId, client_secret=secret, jwt=jwt,
-        )
+        if body.sourceType == "s3":
+            secret = body.s3SecretAccessKey or (crypto.decrypt(cfg.s3_secret_access_key_enc) if (cfg and cfg.s3_secret_access_key_enc) else "")
+            mode = await run_in_threadpool(
+                s3_client.test_connection,
+                endpoint=body.s3Endpoint, region=body.s3Region, bucket=body.s3Bucket,
+                prefix=body.s3Prefix, access_key_id=body.s3AccessKeyId, secret_access_key=secret,
+            )
+        else:
+            secret = body.clientSecret or (crypto.decrypt(cfg.client_secret_enc) if (cfg and cfg.client_secret_enc) else "")
+            jwt = body.jwt or (crypto.decrypt(cfg.jwt_enc) if (cfg and cfg.jwt_enc) else "")
+            # With a JWT this performs a real RingCentral/BT Cloud Work auth; without one it
+            # just validates the fields (demo mode).
+            mode = await run_in_threadpool(
+                bt_client.test_connection,
+                endpoint=body.endpoint, client_id=body.clientId, client_secret=secret, jwt=jwt,
+            )
     except Exception as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"connection failed: {exc}") from exc
     return {"ok": True, "mode": mode}
