@@ -27,7 +27,11 @@ class Recording(Base):
     __tablename__ = "recordings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
     org_id: Mapped[str] = mapped_column(String, index=True)
-    ext_id: Mapped[str] = mapped_column(String)  # BT Cloud recording id — dedup key within an org
+    ext_id: Mapped[str] = mapped_column(String)  # BT Cloud recording id / S3 object key — dedup key within an org
+    # Which connector this specific recording came from — "bt_cloud" | "s3". Recorded
+    # at fetch time (not read from the org's *current* settings) so playback knows
+    # whether real audio is even fetchable, regardless of what the org is on now.
+    source_type: Mapped[str] = mapped_column(String, default="bt_cloud")
     caller: Mapped[str] = mapped_column(String, default="")
     phone: Mapped[str] = mapped_column(String, default="")
     agent: Mapped[str] = mapped_column(String, default="")
@@ -54,10 +58,22 @@ class VoiceSettings(Base):
     __tablename__ = "voice_settings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
     org_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    # Which connector fetch_and_process() dispatches to — "bt_cloud" | "s3". Both field sets
+    # below persist regardless of which is active, so switching doesn't discard the other.
+    source_type: Mapped[str] = mapped_column(String, default="bt_cloud")
+    # BT Cloud (RingCentral)
     endpoint: Mapped[str] = mapped_column(String, default="")  # RingCentral/BT Cloud Work server URL
     client_id: Mapped[str] = mapped_column(String, default="")
     client_secret_enc: Mapped[str] = mapped_column(Text, default="")
     jwt_enc: Mapped[str] = mapped_column(Text, default="")  # RingCentral JWT credential (server-to-server auth)
+    # S3-compatible bucket (AWS S3, Backblaze B2, MinIO, …)
+    s3_endpoint: Mapped[str] = mapped_column(String, default="")  # blank = AWS default; set for Backblaze B2/other
+    s3_region: Mapped[str] = mapped_column(String, default="")
+    s3_bucket: Mapped[str] = mapped_column(String, default="")
+    s3_prefix: Mapped[str] = mapped_column(String, default="")  # optional folder path within the bucket
+    s3_access_key_id: Mapped[str] = mapped_column(String, default="")
+    s3_secret_access_key_enc: Mapped[str] = mapped_column(Text, default="")
+    # shared
     cron_frequency: Mapped[str] = mapped_column(String, default="every6h")  # hourly|every6h|daily
     cron_time: Mapped[str] = mapped_column(String, default="02:00")         # HH:mm (daily only)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
