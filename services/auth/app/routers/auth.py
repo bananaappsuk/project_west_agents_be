@@ -71,22 +71,25 @@ async def _ensure_permissions(session: AsyncSession, app: Application, keys: lis
     return out
 
 
-@router.post("/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterIn, session: AsyncSession = Depends(get_session)):
-    if not settings.bootstrap_enabled:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "self-serve signup is disabled")
-    if await session.scalar(select(User).where(User.email == body.email)):
-        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
+# Apps auto-provisioned alongside the one a new org actually signs up for —
+# they're companion products on the same platform (see UNDERSTANDING_THE_APP.md),
+# so a fresh org gets Owner access to all of them from one sign-up instead of
+# needing a separate registration per app (which isn't possible anyway, since
+# a second /register call for the same email would 409).
+AUTO_SUBSCRIBE_APPS: dict[str, list[str]] = {
+    "mail-agent": ["voice-agent"],
+}
 
-    user = User(email=body.email, password_hash=hash_password(body.password), full_name=body.full_name)
-    org = Organization(name=body.org_name, slug=_slug(body.org_name))
-    session.add_all([user, org])
 
-    app = await session.scalar(select(Application).where(Application.key == body.app_key))
+async def _provision_owner_membership(
+    session: AsyncSession, *, user: User, org: Organization, app_key: str
+) -> tuple[Application, Membership]:
+    """Find-or-create `app_key` and grant `user` an Owner membership in `org` for it."""
+    app = await session.scalar(select(Application).where(Application.key == app_key))
     if app is None:
-        app = Application(key=body.app_key, name=body.app_key)
+        app = Application(key=app_key, name=app_key)
         session.add(app)
-    await session.flush()
+        await session.flush()
 
     perms = await _ensure_permissions(
         session, app, ["platform:admin", f"{app.key}:admin", f"{app.key}:agent.invoke"]
@@ -97,6 +100,27 @@ async def register(body: RegisterIn, session: AsyncSession = Depends(get_session
     membership = Membership(user_id=user.id, org_id=org.id, app_id=app.id, roles=[role])
     session.add(membership)
     await session.flush()
+    return app, membership
+
+
+@router.post("/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
+async def register(body: RegisterIn, session: AsyncSession = Depends(get_session)):
+    if not settings.bootstrap_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "self-serve signup is disabled")
+    if await session.scalar(select(User).where(User.email == body.email)):
+        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
+
+    user = User(email=body.email, password_hash=hash_password(body.password), full_name=body.full_name)
+    org = Organization(name=body.org_name, slug=_slug(body.org_name))
+    session.add_all([user, org])
+    await session.flush()
+
+    app, membership = await _provision_owner_membership(session, user=user, org=org, app_key=body.app_key)
+
+    for companion_key in AUTO_SUBSCRIBE_APPS.get(body.app_key, []):
+        if companion_key == body.app_key:
+            continue
+        await _provision_owner_membership(session, user=user, org=org, app_key=companion_key)
 
     roles, scope = _token_fields(app.key, membership)
     return await _issue_tokens(session, user=user, org_id=org.id, app=app, roles=roles, scope=scope)
