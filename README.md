@@ -11,8 +11,8 @@ Every application (mail-agent, voice-agent, Rekroot, Educare, …) shares these 
 | `services/auth` | Auth | 8001 | Identity, RBAC, JWT/JWKS, shared common APIs |
 | `services/agent_factory` | Agent Factory | 8002 | Runs all agents (LangGraph). Code-defined agents |
 | `services/billing` | Billing | 8003 | Plans, metering, quotas |
-| `services/apps/mail_agent` | mail-agent | 8010 | Email product APIs (IMAP/SMTP fetch, AI triage, cron) |
-| `services/apps/voice_agent` | voice-agent | 8011 | Call-recording product APIs (BT Cloud fetch, AI analysis, cron) |
+| `services/apps/mail_agent` | mail-agent | 8012 | Email product APIs (IMAP/SMTP fetch, AI triage, cron) |
+| `services/apps/voice_agent` | voice-agent | 8013 | Call-recording product APIs (BT Cloud fetch, AI analysis, cron) |
 | `libs/platform_common` | shared lib | — | Token verification + scope checks (pip-installed by every service) |
 
 ## Conventions
