@@ -33,7 +33,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .config import settings
+from .transcribe import transcribe
 
 log = logging.getLogger("voice_agent.bt_client")
 
@@ -130,22 +130,6 @@ def _download_recording(token: str, content_uri: str) -> tuple[bytes, str]:
         return r.content, r.headers.get("content-type", "audio/mpeg")
 
 
-def _transcribe(audio: bytes, content_type: str) -> str:
-    if not settings.openai_api_key:
-        log.warning("OPENAI_API_KEY unset — storing recording with an empty transcript")
-        return ""
-    ext = "wav" if "wav" in content_type else "mp3"
-    with httpx.Client(timeout=180.0) as c:
-        r = c.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-            files={"file": (f"recording.{ext}", audio, content_type or "audio/mpeg")},
-            data={"model": settings.transcribe_model},
-        )
-        r.raise_for_status()
-        return (r.json().get("text") or "").strip()
-
-
 def _to_raw(rec: dict, token: str) -> dict:
     direction = rec.get("direction")  # "Inbound" | "Outbound"
     frm = rec.get("from") or {}
@@ -167,7 +151,7 @@ def _to_raw(rec: dict, token: str) -> dict:
     if content_uri:
         try:
             audio, ctype = _download_recording(token, content_uri)
-            transcript = _transcribe(audio, ctype)
+            transcript = transcribe(audio, ctype)
         except Exception as exc:
             log.warning("download/transcribe failed for call %s: %s", rec.get("id"), exc)
 
