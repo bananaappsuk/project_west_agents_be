@@ -32,12 +32,17 @@ class FolderPatch(BaseModel):
 
 
 class MailboxIn(BaseModel):
-    imapHost: str
+    provider: str = "imap"  # "imap" | "graph"
+    imapHost: str = ""
     imapPort: int = 993
     smtpHost: str
     smtpPort: int = 587
     username: str
     password: str
+    # Graph (app-only) fields — required when provider == "graph"
+    tenantId: str | None = None
+    clientId: str | None = None
+    clientSecret: str | None = None
 
 
 class AgentConfigIn(BaseModel):
