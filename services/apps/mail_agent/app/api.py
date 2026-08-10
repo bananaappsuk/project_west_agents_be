@@ -7,7 +7,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import agent_client, crypto, mail_client, pipeline
+from . import agent_client, crypto, graph_client, mail_client, pipeline
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -287,11 +287,15 @@ async def get_mailbox(claims: dict = Depends(require(READ)), session: AsyncSessi
     if not mb:
         return None
     return {
+        "provider": mb.provider,
         "imapHost": mb.imap_host,
         "imapPort": mb.imap_port,
         "smtpHost": mb.smtp_host,
         "smtpPort": mb.smtp_port,
         "username": mb.username,
+        "tenantId": mb.tenant_id,
+        "clientId": mb.client_id,
+        "clientSecretConfigured": bool(mb.client_secret_enc),
         "enabled": mb.enabled,
         "configured": True,
     }
@@ -302,15 +306,24 @@ async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), 
     org = _org(claims)
     mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == org))
     enc = crypto.encrypt(body.password.replace(" ", ""))  # app passwords are shown spaced; store without
+    # clientSecret is write-only-if-changed: a blank value keeps whatever was already stored.
+    client_secret_enc = (
+        crypto.encrypt(body.clientSecret) if body.clientSecret
+        else (mailbox.client_secret_enc if mailbox else None)
+    )
     if mailbox:
         mailbox.imap_host, mailbox.imap_port = body.imapHost, body.imapPort
         mailbox.smtp_host, mailbox.smtp_port = body.smtpHost, body.smtpPort
         mailbox.username, mailbox.password_enc, mailbox.enabled = body.username, enc, True
+        mailbox.provider = body.provider
+        mailbox.tenant_id, mailbox.client_id, mailbox.client_secret_enc = body.tenantId, body.clientId, client_secret_enc
     else:
         session.add(Mailbox(
             org_id=org, imap_host=body.imapHost, imap_port=body.imapPort,
             smtp_host=body.smtpHost, smtp_port=body.smtpPort,
             username=body.username, password_enc=enc, enabled=True,
+            provider=body.provider, tenant_id=body.tenantId, client_id=body.clientId,
+            client_secret_enc=client_secret_enc,
         ))
     await session.commit()
     return {"ok": True}
@@ -319,11 +332,22 @@ async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), 
 @router.post("/settings/mailbox/test")
 async def test_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE))):
     try:
-        await run_in_threadpool(
-            mail_client.test_connection,
-            imap_host=body.imapHost, imap_port=body.imapPort,
-            username=body.username, password=body.password.replace(" ", ""),
-        )
+        if body.provider == "graph":
+            if not (body.tenantId and body.clientId and body.clientSecret):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "tenantId, clientId and clientSecret are required")
+            await run_in_threadpool(
+                graph_client.test_connection,
+                tenant_id=body.tenantId, client_id=body.clientId, client_secret=body.clientSecret,
+                mailbox=body.username,
+            )
+        else:
+            await run_in_threadpool(
+                mail_client.test_connection,
+                imap_host=body.imapHost, imap_port=body.imapPort,
+                username=body.username, password=body.password.replace(" ", ""),
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"connection failed: {exc}") from exc
     return {"ok": True}
