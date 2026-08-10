@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 
-from . import agent_client, crypto, mail_client
+from . import agent_client, crypto, graph_client, mail_client
 from .db import SessionLocal
 from .models import AgentRun, Email, Mailbox
 from .schemas import serialize_email
@@ -31,16 +31,29 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
         if not mailbox or not mailbox.enabled:
             log.warning("fetch aborted: org=%s has no enabled mailbox", org_id)
             raise LookupError("no mailbox configured for this org")
-        creds = {
-            "imap_host": mailbox.imap_host,
-            "imap_port": mailbox.imap_port,
-            "username": mailbox.username,
-            "password": crypto.decrypt(mailbox.password_enc),
-        }
+        provider = mailbox.provider
+        if provider == "graph":
+            creds = {
+                "tenant_id": mailbox.tenant_id,
+                "client_id": mailbox.client_id,
+                "client_secret": crypto.decrypt(mailbox.client_secret_enc),
+                "mailbox": mailbox.username,
+            }
+        else:
+            creds = {
+                "imap_host": mailbox.imap_host,
+                "imap_port": mailbox.imap_port,
+                "username": mailbox.username,
+                "password": crypto.decrypt(mailbox.password_enc),
+            }
 
-    # 2) IMAP fetch — NO DB connection held
-    log.info("fetch: connecting IMAP %s:%s as %s", creds["imap_host"], creds["imap_port"], creds["username"])
-    messages = await run_in_threadpool(mail_client.fetch_latest, count=count, **creds)
+    # 2) fetch — NO DB connection held
+    if provider == "graph":
+        log.info("fetch: connecting via Graph as %s", creds["mailbox"])
+        messages = await run_in_threadpool(graph_client.fetch_latest, count=count, **creds)
+    else:
+        log.info("fetch: connecting IMAP %s:%s as %s", creds["imap_host"], creds["imap_port"], creds["username"])
+        messages = await run_in_threadpool(mail_client.fetch_latest, count=count, **creds)
     log.info("fetch: pulled %d message(s) from INBOX", len(messages))
 
     # 3) short txn: sweep + dedup + insert pending; collect (id, payload) for new ones
