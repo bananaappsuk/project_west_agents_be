@@ -81,6 +81,12 @@ class Mailbox(Base):
     password_enc: Mapped[str] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Reading via Microsoft Graph (app-only), for tenants with IMAP Basic Auth disabled.
+    # SMTP sending above is unaffected — Graph only replaces the read path.
+    provider: Mapped[str] = mapped_column(String, default="imap", server_default="imap")  # "imap" | "graph"
+    tenant_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    client_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    client_secret_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AgentConfig(Base):
