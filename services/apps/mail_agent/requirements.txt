@@ -6,3 +6,5 @@ asyncpg>=0.29
 cryptography>=42.0
 httpx>=0.27
 apscheduler>=3.10
+msal>=1.28
+requests>=2.31
