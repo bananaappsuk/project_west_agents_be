@@ -105,6 +105,19 @@ class RefreshToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class PasswordReset(Base):
+    """A pending self-serve password reset. Same one-time-token shape as
+    Invite: only the hash is stored, and it's single-use + time-limited."""
+
+    __tablename__ = "password_resets"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Invite(Base):
     """A pending teammate invite. The raw token is shown once to the inviter; only
     its hash is stored. Accepting it sets the user's password and activates them."""
