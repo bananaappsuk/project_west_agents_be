@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from fastapi.concurrency import run_in_threadpool
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..config import settings
 from ..db import get_session
 from ..deps import current_claims
-from ..models import Application, Invite, Membership, Organization, Permission, RefreshToken, Role, User
-from ..schemas import AcceptInviteIn, LoginIn, LogoutIn, RefreshIn, RegisterIn, TokenOut
+from ..mailer import send_password_reset_email
+from ..models import Application, Invite, Membership, Organization, PasswordReset, Permission, RefreshToken, Role, User
+from ..schemas import (
+    AcceptInviteIn,
+    ForgotPasswordIn,
+    LoginIn,
+    LogoutIn,
+    RefreshIn,
+    RegisterIn,
+    ResetPasswordIn,
+    TokenOut,
+)
 from ..security import (
     create_access_token,
     hash_password,
@@ -22,6 +34,8 @@ from ..security import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+RESET_TTL_HOURS = 2
 
 
 def _utcnow() -> datetime:
@@ -224,6 +238,46 @@ async def logout(body: LogoutIn, session: AsyncSession = Depends(get_session)):
     if rt and not rt.revoked:
         rt.revoked = True
         await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)
+async def forgot_password(body: ForgotPasswordIn, session: AsyncSession = Depends(get_session)):
+    """Public: request a password-reset link. Always returns 204 whether or not the
+    email is registered, so the response can't be used to enumerate accounts."""
+    user = await session.scalar(select(User).where(User.email == body.email))
+    if user and user.is_active:
+        raw = secrets.token_urlsafe(32)
+        session.add(PasswordReset(
+            user_id=user.id, token_hash=hash_token(raw),
+            expires_at=_utcnow() + timedelta(hours=RESET_TTL_HOURS),
+        ))
+        await session.commit()
+        if body.reset_base:
+            link = f"{body.reset_base.rstrip('/')}/reset-password?token={raw}"
+            try:
+                await run_in_threadpool(send_password_reset_email, to=user.email, reset_link=link)
+            except Exception:
+                pass  # SMTP failure shouldn't leak through — the link still exists
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_password(body: ResetPasswordIn, session: AsyncSession = Depends(get_session)):
+    """Public: consume a one-time reset token and set a new password. Revokes all of
+    the user's existing refresh tokens so a stolen session doesn't survive the reset."""
+    pr = await session.scalar(select(PasswordReset).where(PasswordReset.token_hash == hash_token(body.token)))
+    if not pr or pr.used or pr.expires_at <= _utcnow():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired reset link")
+
+    user = await session.get(User, pr.user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+
+    user.password_hash = hash_password(body.password)
+    pr.used = True
+    await session.execute(update(RefreshToken).where(RefreshToken.user_id == user.id).values(revoked=True))
+    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
