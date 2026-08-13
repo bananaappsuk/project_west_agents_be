@@ -40,6 +40,21 @@ async def _get_recording(session: AsyncSession, org: str, rec_id: str) -> Record
     return r
 
 
+async def _get_config(session: AsyncSession, org: str) -> VoiceSettings:
+    """Find-or-create the org's VoiceSettings row. Mirrors mail_agent's `_get_config`:
+    the master on/off switch (`enabled`) defaults on the moment the agent is first
+    looked at, independent of whether a real recording-source connection has been
+    configured yet — same as Email Agent showing "Running" before a mailbox is set
+    up. The scheduler already no-ops gracefully on an enabled-but-unconfigured org
+    (see scheduler.py's "enabled but no endpoint configured — skipping")."""
+    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    if not cfg:
+        cfg = VoiceSettings(org_id=org, enabled=settings.cron_enabled)
+        session.add(cfg)
+        await session.commit()
+    return cfg
+
+
 # ---------- recordings ----------
 @router.get("/recordings")
 async def list_recordings(
@@ -141,7 +156,7 @@ async def send_reply(rec_id: str, claims: dict = Depends(require(WRITE)), sessio
 async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     org = _org(claims)
     rows = list(await session.scalars(select(Recording).where(Recording.org_id == org)))
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    cfg = await _get_config(session, org)
 
     categories = ["Sales Enquiry", "Complaint", "Support", "Booking", "Billing", "General Enquiry"]
     sentiments = ["Positive", "Neutral", "Negative"]
@@ -152,7 +167,7 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
         "new": sum(1 for r in rows if r.status == "new"),
         "pending": sum(1 for r in rows if r.reply_status == "pending"),
         "highRisk": sum(1 for r in rows if r.risk == "High"),
-        "syncStatus": "Healthy" if (cfg and cfg.enabled) else "Down",
+        "syncStatus": "Healthy" if cfg.enabled else "Down",
         "categoryBreakdown": [{"name": c, "count": sum(1 for r in rows if r.category == c)} for c in categories],
         "sentimentBreakdown": [{"name": s, "count": sum(1 for r in rows if r.sentiment == s)} for s in sentiments],
         "agentPerformance": [
@@ -271,7 +286,7 @@ async def mark_all_read(claims: dict = Depends(require(READ)), session: AsyncSes
 @router.get("/agent/status")
 async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     org = _org(claims)
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    cfg = await _get_config(session, org)
     runs = list(await session.scalars(select(AgentRun).where(AgentRun.org_id == org).order_by(AgentRun.run_at.desc())))
     last = runs[0] if runs else None
 
@@ -283,15 +298,15 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
         d["highRisk"] += r.high_risk
 
     next_run = ""
-    if cfg and cfg.enabled and last:
+    if cfg.enabled and last:
         interval = _FREQ_MINUTES.get(cfg.cron_frequency, 360)
         next_run = (last.run_at + timedelta(minutes=interval)).isoformat()
 
     return {
         "config": {
-            "cronFrequency": cfg.cron_frequency if cfg else "every6h",
-            "cronTime": cfg.cron_time if cfg else "02:00",
-            "enabled": bool(cfg and cfg.enabled),
+            "cronFrequency": cfg.cron_frequency,
+            "cronTime": cfg.cron_time,
+            "enabled": cfg.enabled,
         },
         "stats": {
             "totalRuns": len(runs),
