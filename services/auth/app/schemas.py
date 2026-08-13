@@ -40,6 +40,18 @@ class LogoutIn(BaseModel):
     refresh_token: str
 
 
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+    # The requesting frontend's origin (e.g. http://localhost:3000), used to build
+    # the reset link that gets emailed. Optional — if omitted, no email is attempted.
+    reset_base: str | None = None
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    password: str = Field(min_length=8)
+
+
 # ---- admin / RBAC ----
 class ApplicationIn(BaseModel):
     key: str
