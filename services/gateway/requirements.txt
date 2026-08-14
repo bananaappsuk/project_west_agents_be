@@ -1,4 +1,5 @@
--e ../../libs/platform_common
 fastapi>=0.110
+pyjwt[crypto]>=2.8
+pydantic-settings>=2.2
 uvicorn[standard]>=0.27
 httpx>=0.27

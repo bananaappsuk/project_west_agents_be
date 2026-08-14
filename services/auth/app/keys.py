@@ -21,7 +21,7 @@ _KEY_PATH = Path("keys/private.pem")
 
 def _load_or_create_pem() -> str:
     if settings.private_key_pem:
-        return settings.private_key_pem
+        return settings.private_key_pem.replace("\\n", "\n")
     if _KEY_PATH.exists():
         return _KEY_PATH.read_text()
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
