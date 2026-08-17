@@ -36,7 +36,10 @@ class Subscription(Base):
     org_id: Mapped[str] = mapped_column(String, index=True)
     app_key: Mapped[str] = mapped_column(String, index=True)
     plan_id: Mapped[str] = mapped_column(String)
-    status: Mapped[str] = mapped_column(String, default="active")  # active | past_due | canceled
+    status: Mapped[str] = mapped_column(String, default="active")  # active | trialing | past_due | canceled
+    stripe_customer_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (UniqueConstraint("org_id", "app_key", name="uq_subscription_org_app"),)
 
