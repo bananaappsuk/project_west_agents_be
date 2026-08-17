@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 
-from . import agent_client, crypto, graph_client, mail_client
+from . import agent_client, billing_client, crypto, graph_client, mail_client
 from .db import SessionLocal
 from .models import AgentRun, Email, Mailbox
 from .schemas import serialize_email
@@ -22,8 +22,12 @@ log = logging.getLogger("mail_agent.pipeline")
 
 
 async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:
-    """Returns the ids of newly-fetched emails."""
+    """Returns the ids of newly-fetched emails.
+
+    Raises BillingBlocked (before any IMAP/SMTP work happens) if the org's
+    subscription is inactive or this month's analysis quota is used up."""
     log.info("fetch start: org=%s count=%d sweep=%s", org_id, count, sweep)
+    await billing_client.check_entitlement(org_id)
 
     # 1) short txn: read mailbox creds
     async with SessionLocal() as s:
@@ -119,4 +123,8 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
         ))
         await s.commit()
     log.info("run recorded: org=%s fetched=%d processed=%d high=%d", org_id, len(messages), len(new), high)
+
+    analyzed_ok = sum(1 for _, _, ok in results if ok)
+    await billing_client.record_usage(org_id, analyzed_ok)
+
     return [eid for eid, _ in new]
