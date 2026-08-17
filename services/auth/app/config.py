@@ -12,6 +12,14 @@ class Settings(BaseServiceSettings):
 
     bootstrap_enabled: bool = True       # allow self-serve signup via /auth/register
 
+    # Billing service — register() calls POST {billing_url}/subscriptions to start
+    # a trial right after provisioning. Must match Billing's INTERNAL_API_KEY.
+    # If billing_url is unset, trial provisioning is skipped (registration still
+    # succeeds — billing is not on the critical path for using the product).
+    billing_url: str | None = None
+    billing_internal_key: str | None = None
+    billing_trial_plan_id: str = "platform.trial"
+
     # White-label display name — used as the invite email's "From" name when
     # SMTP_FROM isn't set explicitly. Keep in sync with the frontend's
     # NEXT_PUBLIC_APP_NAME for one consistent brand across the deployment.
