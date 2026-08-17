@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import agent_client, crypto, graph_client, mail_client, pipeline
+from .billing_client import BillingBlocked
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -63,6 +64,8 @@ async def fetch_emails(
 ):
     try:
         new_ids = await pipeline.fetch_and_process(_org(claims), count)
+    except BillingBlocked as exc:
+        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, {"code": exc.code, "message": str(exc)}) from exc
     except LookupError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except Exception as exc:
