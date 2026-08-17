@@ -1,4 +1,71 @@
-"""Fetch → sweep(new→old) → dedup → insert(pending) → analyse via Agent Factory →
+git add "services/apps/mail_agent/.env.example"
+git commit -m "chore: update mail agent environment configuration"
+
+git add "services/apps/mail_agent/app/api.py"
+git commit -m "feat: enhance mail agent API"
+
+git add "services/apps/mail_agent/app/config.py"
+git commit -m "feat: update mail agent configuration"
+
+git add "services/apps/mail_agent/app/pipeline.py"
+git commit -m "feat: enhance mail agent pipeline"
+
+git add "services/apps/mail_agent/app/billing_client.py"
+git commit -m "feat: add billing client to mail agent"
+
+git add "services/apps/voice_agent/.env.example"
+git commit -m "chore: update voice agent environment configuration"
+
+git add "services/apps/voice_agent/app/api.py"
+git commit -m "feat: enhance voice agent API"
+
+git add "services/apps/voice_agent/app/config.py"
+git commit -m "feat: update voice agent configuration"
+
+git add "services/apps/voice_agent/app/pipeline.py"
+git commit -m "feat: enhance voice agent pipeline"
+
+git add "services/apps/voice_agent/app/billing_client.py"
+git commit -m "feat: add billing client to voice agent"
+
+git add "services/auth/.env.example"
+git commit -m "chore: update auth environment configuration"
+
+git add "services/auth/app/config.py"
+git commit -m "feat: update authentication configuration"
+
+git add "services/auth/app/routers/auth.py"
+git commit -m "feat: enhance authentication routes"
+
+git add "services/auth/app/billing_client.py"
+git commit -m "feat: add billing client to auth service"
+
+git add "services/auth/requirements.txt"
+git commit -m "build: update auth service dependencies"
+
+git add "services/billing/.env.example"
+git commit -m "chore: update billing environment configuration"
+
+git add "services/billing/app/config.py"
+git commit -m "feat: update billing configuration"
+
+git add "services/billing/app/main.py"
+git commit -m "feat: enhance billing service startup"
+
+git add "services/billing/app/models.py"
+git commit -m "feat: update billing models"
+
+git add "services/billing/requirements.txt"
+git commit -m "build: update billing service dependencies"
+
+git add "services/billing/platform_common/"
+git commit -m "feat: add shared billing platform components"
+
+git add "services/gateway/app/config.py"
+git commit -m "feat: update gateway configuration"
+
+git add "services/gateway/app/main.py"
+git commit -m "feat: enhance gateway startup""""Fetch → sweep(new→old) → dedup → insert(pending) → analyse via Agent Factory →
 done/failed → record run + notification.
 
 DB connections are held only for short transactions; the BT Cloud fetch and the LLM
@@ -13,16 +80,30 @@ import logging
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 
-from . import agent_client, bt_client, crypto, s3_client
+from . import agent_client, billing_client, bt_client, crypto, s3_client
 from .db import SessionLocal
 from .models import AgentRun, Notification, Recording, VoiceSettings
 
 log = logging.getLogger("voice_agent.pipeline")
 
 
+def _duration_minutes(duration: str) -> float:
+    """Parses the "M:SS" duration string (see models.py) into minutes."""
+    try:
+        m, s = duration.split(":", 1)
+        return int(m) + int(s) / 60
+    except (ValueError, AttributeError):
+        return 0.0
+
+
 async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:
-    """Returns the ids of newly-fetched recordings."""
+    """Returns the ids of newly-fetched recordings.
+
+    Raises BillingBlocked (before any recording-source fetch happens) if the
+    org's subscription is inactive or this month's review-minute quota is
+    used up."""
     log.info("fetch start: org=%s count=%d sweep=%s", org_id, count, sweep)
+    await billing_client.check_entitlement(org_id)
 
     # 1) short txn: read the org's connection settings for whichever source is active
     async with SessionLocal() as s:
@@ -127,4 +208,9 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
             s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
         await s.commit()
     log.info("run recorded: org=%s fetched=%d processed=%d high_risk=%d", org_id, len(recordings), len(new), high)
+
+    ok_by_id = {rec_id: ok for rec_id, _, ok in results}
+    analyzed_minutes = sum(_duration_minutes(p["duration"]) for rec_id, p in new if ok_by_id.get(rec_id))
+    await billing_client.record_usage(org_id, analyzed_minutes)
+
     return [rid for rid, _ in new]
