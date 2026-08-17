@@ -10,6 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..billing_client import start_trial
 from ..config import settings
 from ..db import get_session
 from ..deps import current_claims
@@ -135,6 +136,12 @@ async def register(body: RegisterIn, session: AsyncSession = Depends(get_session
         if companion_key == body.app_key:
             continue
         await _provision_owner_membership(session, user=user, org=org, app_key=companion_key)
+
+    # Billing scopes one Subscription per org under "mail-agent" regardless of which
+    # app_key was used to register — a single plan covers both channels equally (see
+    # LANDING_PAGE_AND_PAYMENTS_PLAN.md §4). Best-effort: billing being unreachable
+    # must not block registration.
+    await start_trial(org_id=org.id, app_key="mail-agent")
 
     roles, scope = _token_fields(app.key, membership)
     return await _issue_tokens(session, user=user, org_id=org.id, app=app, roles=roles, scope=scope)
