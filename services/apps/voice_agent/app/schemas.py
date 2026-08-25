@@ -15,6 +15,10 @@ class ReplyDraftIn(BaseModel):
     body: str
 
 
+class RelabelIn(BaseModel):
+    label: str
+
+
 class SettingsIn(BaseModel):
     sourceType: str = "bt_cloud"     # "bt_cloud" | "s3" — which fields below are in play
     # BT Cloud (RingCentral)
@@ -39,6 +43,7 @@ class SettingsIn(BaseModel):
 def serialize_recording(r: Recording) -> dict:
     return {
         "id": r.id,
+        "label": r.label,
         "caller": r.caller,
         "phone": r.phone,
         "agent": r.agent,
