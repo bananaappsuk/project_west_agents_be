@@ -18,10 +18,17 @@ from ...llm import analyze_email
 from ...registry import register
 
 
+# Categories that always need a human decision, no matter how confident the model is —
+# billing/refund and security matters are exactly the "sensitive" cases that shouldn't
+# auto-send without a person looking at them first.
+_SENSITIVE_CATEGORIES = {"Security", "Billing"}
+
+
 class MailState(TypedDict, total=False):
     email: dict       # {from, fromEmail, subject, body}
     analysis: dict    # MailAnalysis as a dict
     escalate: bool
+    auto_sendable: bool
 
 
 def _analyze(state: MailState) -> dict:
@@ -29,8 +36,14 @@ def _analyze(state: MailState) -> dict:
 
 
 def _guardrail(state: MailState) -> dict:
-    confidence = (state.get("analysis") or {}).get("confidence", 0.0)
-    return {"escalate": confidence < settings.confidence_threshold}
+    analysis = state.get("analysis") or {}
+    confidence = analysis.get("confidence", 0.0)
+    auto_sendable = (
+        analysis.get("needs_reply", False)
+        and confidence >= settings.auto_send_confidence_threshold
+        and analysis.get("category") not in _SENSITIVE_CATEGORIES
+    )
+    return {"escalate": confidence < settings.confidence_threshold, "auto_sendable": auto_sendable}
 
 
 @register
