@@ -64,4 +64,8 @@ async def invoke(
     analysis = result.get("analysis") or {}
     log.info("invoke %s.%s -> %s/%s (escalate=%s)", app_key, agent_key,
              analysis.get("category"), analysis.get("priority"), result.get("escalate"))
-    return {"analysis": result.get("analysis"), "escalate": result.get("escalate")}
+    return {
+        "analysis": result.get("analysis"),
+        "escalate": result.get("escalate"),
+        "auto_sendable": result.get("auto_sendable"),
+    }
