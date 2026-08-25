@@ -1,24 +1,28 @@
 from __future__ import annotations
 
-from datetime import timedelta
+import logging
+import uuid
+from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import bt_client, crypto, pipeline, s3_client
-from .billing_client import BillingBlocked
+from . import agent_client, bt_client, crypto, pipeline, s3_client, transcribe
 from .config import settings
 from .db import get_session
 from .deps import require
 from .models import AgentRun, Notification, Recording, VoiceSettings
 from .schemas import (
+    RelabelIn,
     ReplyDraftIn,
     SettingsIn,
     serialize_notification,
     serialize_recording,
 )
+
+log = logging.getLogger("voice_agent.api")
 
 # All voice endpoints live under /voice so they never collide with the mail agent's
 # /settings, /agent, etc. at the gateway.
@@ -70,30 +74,115 @@ async def list_recordings(
     return [serialize_recording(r) for r in rows]
 
 
-@router.post("/recordings/fetch")
+@router.post("/recordings/fetch", status_code=status.HTTP_202_ACCEPTED)
 async def fetch_recordings(
+    background_tasks: BackgroundTasks,
     count: int = 12,
     sweep: bool = True,
     claims: dict = Depends(require(WRITE)),
     session: AsyncSession = Depends(get_session),
 ):
+    """Kicks off a fetch+analyze run in the background and returns immediately —
+    a full sync can take minutes on a large batch (sequential LLM calls, 5 at a
+    time), far longer than any request should stay open. Poll GET /voice/agent/status
+    (its `running` flag) to know when it's done — that's real server state, so it
+    stays correct no matter which page you're on."""
+    org = _org(claims)
+    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    if not cfg or not cfg.enabled:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no recording source configured for this org")
+
+    if pipeline.is_running(org):
+        raise HTTPException(status.HTTP_409_CONFLICT, "a sync is already in progress")
+
+    background_tasks.add_task(pipeline.fetch_and_process, org, count, sweep=sweep)
+    return {"status": "started"}
+
+
+@router.post("/recordings/upload")
+async def upload_recording(
+    file: UploadFile = File(...),
+    save_audio: bool = Form(False),
+    label: str | None = Form(None),
+    claims: dict = Depends(require(WRITE)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Hand the agent an audio file directly instead of waiting on the cron sync.
+    Reuses the same transcription + analysis steps the BT Cloud/S3 pipeline uses.
+    `save_audio` opts into keeping the file (in the org's already-configured S3-compatible
+    bucket) for playback afterward — the default mirrors the rest of the product's
+    discard-after-transcribe policy, so BT-Cloud-style recordings with no playback."""
+    org = _org(claims)
+    audio = await file.read()
+    content_type = file.content_type or "audio/mpeg"
+    transcript = await run_in_threadpool(transcribe.transcribe, audio, content_type)
+
+    source_type, ext_id = "upload", str(uuid.uuid4())
+    if save_audio:
+        cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+        if not cfg or not cfg.s3_bucket:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "no S3-compatible storage configured for this org — set one up in Settings to save audio",
+            )
+        ext = "wav" if "wav" in content_type else "mp3"
+        key = f"uploads/{ext_id}.{ext}"
+        try:
+            await run_in_threadpool(
+                s3_client.upload_object,
+                endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
+                access_key_id=cfg.s3_access_key_id,
+                secret_access_key=crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
+                key=key, body=audio, content_type=content_type,
+            )
+        except Exception as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not save audio: {exc}") from exc
+        source_type, ext_id = "s3", key
+
+    caller = file.filename or "Uploaded recording"
     try:
-        new_ids = await pipeline.fetch_and_process(_org(claims), count, sweep=sweep)
-    except BillingBlocked as exc:
-        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, {"code": exc.code, "message": str(exc)}) from exc
-    except LookupError as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        res = await agent_client.analyze_call({
+            "caller": caller, "phone": "", "agent": "Uploaded", "duration": "", "transcript": transcript,
+        })
+        a = res.get("analysis") or {}
+        analysis_status = "done"
     except Exception as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"BT Cloud fetch failed: {exc}") from exc
-    if not new_ids:
-        return []
-    rows = await session.scalars(select(Recording).where(Recording.id.in_(new_ids)))
-    return [serialize_recording(r) for r in rows]
+        log.warning("upload analysis FAILED: %s", exc)
+        a, analysis_status = {}, "failed"
+
+    row = Recording(
+        org_id=org, ext_id=ext_id, source_type=source_type,
+        label=(label or "").strip() or None,
+        caller=caller, phone="", agent="Uploaded",
+        call_date=date.today().isoformat(), duration="",
+        transcript=transcript or "(no transcript available)",
+        summary=a.get("summary", ""), category=a.get("category", "General Enquiry"),
+        priority=a.get("priority", "Medium"), risk=a.get("risk", "Low"), sentiment=a.get("sentiment", "Neutral"),
+        needs_reply=bool(a.get("needs_reply", False)), ai_reply=a.get("suggested_reply", "") or "",
+        reply_status="pending" if a.get("needs_reply") else "none",
+        analysis_status=analysis_status, status="new",
+    )
+    session.add(row)
+    await session.commit()
+    return serialize_recording(row)
 
 
 @router.get("/recordings/{rec_id}")
 async def get_recording(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     return serialize_recording(await _get_recording(session, _org(claims), rec_id))
+
+
+@router.patch("/recordings/{rec_id}/label")
+async def relabel_recording(
+    rec_id: str, body: RelabelIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)
+):
+    """Rename a recording's display name — purely cosmetic (doesn't touch `caller`,
+    which for a real call is the actual caller ID, not something to relabel)."""
+    r = await _get_recording(session, _org(claims), rec_id)
+    trimmed = body.label.strip()
+    r.label = trimmed or None
+    await session.commit()
+    return serialize_recording(r)
 
 
 @router.get("/recordings/{rec_id}/audio")
@@ -306,6 +395,7 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
         next_run = (last.run_at + timedelta(minutes=interval)).isoformat()
 
     return {
+        "running": pipeline.is_running(org),
         "config": {
             "cronFrequency": cfg.cron_frequency,
             "cronTime": cfg.cron_time,
@@ -321,7 +411,7 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
         },
         "history": [
             {"runAt": r.run_at.isoformat(), "fetched": r.fetched, "processed": r.processed,
-             "highRisk": r.high_risk, "status": r.status}
+             "highRisk": r.high_risk, "status": r.status, "errorMessage": r.error_message}
             for r in runs[:20]
         ],
         "daily": sorted(daily.values(), key=lambda d: d["day"])[-7:],
