@@ -134,6 +134,17 @@ def test_connection(
     return "live"
 
 
+def upload_object(
+    *, endpoint: str, region: str, bucket: str, access_key_id: str, secret_access_key: str,
+    key: str, body: bytes, content_type: str,
+) -> None:
+    """Stores an uploaded recording's audio in the org's S3-compatible bucket so it can
+    be played back later the same way an S3-sourced recording can — used by the manual
+    upload flow when the user opts in to keeping the audio (see api.py's /recordings/upload)."""
+    client = _client(endpoint=endpoint, region=region, access_key_id=access_key_id, secret_access_key=secret_access_key)
+    client.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type or "audio/mpeg")
+
+
 def download(
     *, endpoint: str, region: str, bucket: str, access_key_id: str, secret_access_key: str, key: str,
 ) -> tuple[bytes, str]:
