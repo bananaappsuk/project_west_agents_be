@@ -21,7 +21,6 @@ from .models import AgentConfig, AgentRun, Mailbox
 
 log = logging.getLogger("mail_agent.scheduler")
 scheduler = AsyncIOScheduler()
-_running: set[str] = set()  # org_ids with a run in flight — prevents tick pileup
 
 _INTERVAL_MINUTES = {
     "Every 15 minutes": 15,
@@ -44,7 +43,7 @@ async def _tick() -> None:
     now = datetime.now(timezone.utc)
 
     for cfg in enabled:
-        if cfg.org_id in _running:
+        if pipeline.is_running(cfg.org_id):
             log.info("org=%s previous run still in progress — skipping this tick", cfg.org_id)
             continue
 
@@ -65,16 +64,18 @@ async def _tick() -> None:
                 log.info("org=%s not due yet (interval=%dm, ~%dm remaining)", cfg.org_id, interval, due_in)
                 continue
 
-        # DB connection released before the slow fetch + LLM work
-        _running.add(cfg.org_id)
+        # DB connection released before the slow fetch + LLM work. pipeline.py
+        # owns the running-guard and already logs + records failure on the
+        # AgentRun row itself — this catch just keeps one org's failure from
+        # stopping the tick loop from reaching the rest.
         log.info("org=%s DUE — running fetch (interval=%dm)", cfg.org_id, interval)
         try:
-            new = await pipeline.fetch_and_process(cfg.org_id, settings.fetch_per_run, sweep=True)
+            # count=0 (the default): fetch everything not yet synced, driven by
+            # the mailbox's watermark, not a fixed per-run cap — see pipeline.py.
+            new = await pipeline.fetch_and_process(cfg.org_id, sweep=True)
             log.info("org=%s cron run complete — %d new email(s)", cfg.org_id, len(new))
         except Exception:
             log.exception("org=%s cron run FAILED", cfg.org_id)
-        finally:
-            _running.discard(cfg.org_id)
 
 
 def start() -> None:
