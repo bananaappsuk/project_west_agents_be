@@ -21,6 +21,8 @@ class MailAnalysis(BaseModel):
     summary: str = Field(description="One-line summary of what the email is asking for")
     category: str = Field(description="One of: Billing, Support, Sales, Security, General")
     priority: Literal["High", "Medium", "Low"]
+    needs_reply: bool = Field(description="Whether this email warrants a reply to the sender")
+    suggested_reply: str = Field(default="", description="A drafted reply if one is needed, else empty")
     confidence: float = Field(ge=0.0, le=1.0, description="0-1 confidence in the classification")
 
 
@@ -43,7 +45,8 @@ def _analyze_llm(email: dict) -> MailAnalysis:
     system = (
         "You triage inbound customer email. Produce a one-line summary, a category "
         "(Billing, Support, Sales, Security, General), a priority (High, Medium, Low), "
-        "and your confidence from 0 to 1."
+        "whether a reply to the sender is warranted, and — if so — a short, professional "
+        "suggested reply addressed to the sender by first name. Set confidence 0-1."
     )
     human = (
         f"From: {email.get('from')} <{email.get('fromEmail')}>\n"
@@ -77,7 +80,20 @@ def _analyze_stub(email: dict) -> MailAnalysis:
 
     first_line = body.split("\n", 1)[0] if body else subject
     summary = (first_line or "(no content)")[:160]
-    return MailAnalysis(summary=summary, category=category, priority=priority, confidence=0.5)
+
+    first_name = (email.get("from") or "there").split()[0]
+    needs_reply = category != "General"
+    suggested = ""
+    if needs_reply:
+        suggested = (
+            f"Hi {first_name},\n\nThanks for reaching out regarding \"{subject}\". "
+            "We've received your message and will get back to you shortly.\n\n"
+            "Best regards,\nSupport Team"
+        )
+    return MailAnalysis(
+        summary=summary, category=category, priority=priority,
+        needs_reply=needs_reply, suggested_reply=suggested, confidence=0.5,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
