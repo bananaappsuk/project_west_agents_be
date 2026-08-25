@@ -32,6 +32,11 @@ class Recording(Base):
     # at fetch time (not read from the org's *current* settings) so playback knows
     # whether real audio is even fetchable, regardless of what the org is on now.
     source_type: Mapped[str] = mapped_column(String, default="bt_cloud")
+    # User-facing display name, distinct from `caller` (a real call's caller ID is
+    # not something the user should be renaming). Set at upload time (defaults to
+    # the file name minus its extension) and editable afterward from the detail
+    # page. Falls back to `caller` in the UI when unset — see serialize_recording.
+    label: Mapped[str | None] = mapped_column(String, nullable=True)
     caller: Mapped[str] = mapped_column(String, default="")
     phone: Mapped[str] = mapped_column(String, default="")
     agent: Mapped[str] = mapped_column(String, default="")
@@ -97,4 +102,5 @@ class AgentRun(Base):
     fetched: Mapped[int] = mapped_column(Integer, default=0)
     processed: Mapped[int] = mapped_column(Integer, default=0)
     high_risk: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String, default="success")  # success|partial|failed
+    status: Mapped[str] = mapped_column(String, default="success")  # running|success|partial|failed
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)  # set when status="failed"
