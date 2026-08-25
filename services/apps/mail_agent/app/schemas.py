@@ -49,6 +49,7 @@ class AgentConfigIn(BaseModel):
     cronInterval: str | None = None
     fetchPerRun: int | None = None
     enabled: bool | None = None
+    autoReplyEnabled: bool | None = None
 
 
 # ---- serializers (ORM -> frontend JSON) ----
@@ -61,13 +62,17 @@ def serialize_email(e: Email) -> dict:
         "subject": e.subject,
         "receivedAt": e.received_at.isoformat() if e.received_at else None,
         "body": e.body,
+        "contentType": e.content_type or "text",
         "summary": e.summary or "",
         "category": e.category or "",
         "priority": e.priority or "Medium",
+        "confidence": e.confidence or 0.0,
+        "needsReply": e.needs_reply,
         "read": e.read,
         "draftReply": e.draft_reply,
         "summaryStatus": e.summary_status,
         "replyStatus": e.reply_status,
+        "autoSent": e.auto_sent,
         "folderId": e.folder_id,
         "archivedAt": e.archived_at.isoformat() if e.archived_at else None,
         "archivedBy": e.archived_by,
