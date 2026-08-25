@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
@@ -19,11 +20,61 @@ from .models import AgentRun, Notification, Recording, VoiceSettings
 
 log = logging.getLogger("voice_agent.pipeline")
 
+# In-memory guard against two overlapping runs for the same org — a manual "Sync
+# now" click and a cron tick landing at the same moment, or a double-click. Only
+# valid because this service runs as a single process (see run-all.ps1 — no
+# --workers); the scheduler's own tick-pileup guard defers to this same set.
+_running: set[str] = set()
+
+# A row stuck at analysis_status="pending" past this age was inserted by a run
+# that never finished analyzing it (crashed process, killed connection, a very
+# large batch that got interrupted) — since fetch only ever looks at ext_ids it
+# hasn't seen before, such a row would otherwise stay "pending" forever. Every
+# subsequent run sweeps these back in for another analysis attempt.
+_STUCK_PENDING_AFTER = timedelta(minutes=10)
+
+
+def is_running(org_id: str) -> bool:
+    return org_id in _running
+
 
 async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:
-    """Returns the ids of newly-fetched recordings."""
-    log.info("fetch start: org=%s count=%d sweep=%s", org_id, count, sweep)
+    """Returns the ids of newly-fetched recordings. Raises RuntimeError if a run
+    for this org is already in progress.
 
+    Runs as a background task (see api.py's /recordings/fetch) rather than being
+    awaited inline by an HTTP request — a full sync can take minutes on a large
+    batch, far longer than any request should stay open. An `AgentRun` row is
+    created up front with status="running" so any page can poll GET /voice/agent/status
+    to see progress, regardless of which page issued the request or whether that
+    page is even still mounted."""
+    if org_id in _running:
+        raise RuntimeError(f"a sync is already in progress for org={org_id}")
+    _running.add(org_id)
+
+    async with SessionLocal() as s:
+        run = AgentRun(org_id=org_id, status="running")
+        s.add(run)
+        await s.commit()
+        run_id = run.id
+    log.info("fetch start: org=%s count=%d sweep=%s run=%s", org_id, count, sweep, run_id)
+
+    try:
+        return await _run(org_id, count, sweep, run_id)
+    except Exception as exc:
+        log.exception("fetch FAILED: org=%s run=%s", org_id, run_id)
+        async with SessionLocal() as s:
+            r = await s.get(AgentRun, run_id)
+            if r:
+                r.status = "failed"
+                r.error_message = str(exc)[:2000]
+                await s.commit()
+        raise
+    finally:
+        _running.discard(org_id)
+
+
+async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
     # 1) short txn: read the org's connection settings for whichever source is active
     async with SessionLocal() as s:
         cfg = await s.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org_id))
@@ -54,10 +105,18 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
     recordings = await run_in_threadpool(fetch_fn, count, **creds)
     log.info("fetch: pulled %d recording(s) via %s", len(recordings), source_type)
 
-    # 3) short txn: sweep prior 'new' -> 'old', dedup + insert pending
+    # 3) short txn: dedup, then sweep prior 'new' -> 'old' only if this run actually
+    # has something to replace them with — an empty/all-duplicate fetch (source
+    # temporarily returned nothing, or a re-run within the same window) must never
+    # archive the existing "new" bucket with nothing to show for it.
     new: list[tuple[str, dict]] = []
     async with SessionLocal() as s:
-        if sweep:
+        fresh = [
+            m for m in recordings
+            if not await s.scalar(select(Recording).where(Recording.org_id == org_id, Recording.ext_id == m["ext_id"]))
+        ]
+
+        if sweep and fresh:
             prior = list(await s.scalars(
                 select(Recording).where(Recording.org_id == org_id, Recording.status == "new")
             ))
@@ -65,9 +124,8 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
                 r.status = "old"
             if prior:
                 log.info("sweep: moved %d recording(s) new -> old", len(prior))
-        for m in recordings:
-            if await s.scalar(select(Recording).where(Recording.org_id == org_id, Recording.ext_id == m["ext_id"])):
-                continue  # dedup
+
+        for m in fresh:
             row = Recording(
                 org_id=org_id, ext_id=m["ext_id"], source_type=source_type, caller=m["caller"], phone=m["phone"],
                 agent=m["agent"], call_date=m["date"], duration=m["duration"],
@@ -79,6 +137,25 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
                 "caller": row.caller, "phone": row.phone, "agent": row.agent,
                 "duration": row.duration, "transcript": row.transcript,
             }))
+
+        # Self-heal: a row stuck "pending" from a run that never finished analyzing
+        # it (see _STUCK_PENDING_AFTER) would otherwise be invisible to every future
+        # fetch — dedup only looks at *new* ext_ids. Re-queue it here using its
+        # already-stored transcript, no need to re-fetch/re-transcribe it.
+        stale_cutoff = datetime.now(timezone.utc) - _STUCK_PENDING_AFTER
+        stuck = list(await s.scalars(
+            select(Recording).where(
+                Recording.org_id == org_id, Recording.analysis_status == "pending",
+                Recording.created_at < stale_cutoff,
+            )
+        ))
+        if stuck:
+            log.info("re-queuing %d stuck-pending recording(s) from an earlier interrupted run", len(stuck))
+            new.extend((r.id, {
+                "caller": r.caller, "phone": r.phone, "agent": r.agent,
+                "duration": r.duration, "transcript": r.transcript,
+            }) for r in stuck)
+
         await s.commit()
     log.info("fetch: %d new recording(s) after dedup", len(new))
 
@@ -118,10 +195,10 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
             else:
                 r.analysis_status = "failed"
         all_ok = all(ok for _, _, ok in results)
-        s.add(AgentRun(
-            org_id=org_id, fetched=len(recordings), processed=len(new),
-            high_risk=high, status="success" if all_ok else "partial",
-        ))
+        run = await s.get(AgentRun, run_id)
+        if run:
+            run.fetched, run.processed, run.high_risk = len(recordings), len(new), high
+            run.status = "success" if all_ok else "partial"
         if new:
             source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
             s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
