@@ -8,7 +8,8 @@ from .config import settings
 
 
 async def analyze_email(email_payload: dict) -> dict:
-    """Return {"analysis": {summary, category, priority, confidence}, "escalate": bool}."""
+    """Return {"analysis": {summary, category, priority, needs_reply, suggested_reply,
+    confidence}, "escalate": bool, "auto_sendable": bool}."""
     url = f"{settings.agent_factory_url}/agents/{settings.app_key}/mail/invoke"
     headers: dict[str, str] = {}
     if settings.agent_factory_internal_key:
