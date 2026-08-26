@@ -74,6 +74,29 @@ async def list_recordings(
     return [serialize_recording(r) for r in rows]
 
 
+@router.get("/alerts")
+async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
+    """Mirrors mail_agent's GET /alerts: high-priority and high-risk calls, not a
+    separate table — recomputed from the recordings themselves each time so it can
+    never drift from what /voice/recordings actually shows."""
+    rows = await session.scalars(select(Recording).where(Recording.org_id == _org(claims)))
+    alerts = []
+    for r in rows:
+        is_high_risk = r.risk == "High"
+        if r.priority == "High" or is_high_risk:
+            title = r.label or r.caller or "Unknown caller"
+            alerts.append({
+                "id": f"a-{r.id}",
+                "recordingId": r.id,
+                "type": "risk" if is_high_risk else "priority",
+                "message": (f'High-risk call flagged: "{title}"' if is_high_risk
+                            else f'High-priority call: "{title}"'),
+                "priority": r.priority,
+                "createdAt": r.created_at.isoformat() if r.created_at else None,
+            })
+    return alerts
+
+
 @router.post("/recordings/fetch", status_code=status.HTTP_202_ACCEPTED)
 async def fetch_recordings(
     background_tasks: BackgroundTasks,
@@ -407,12 +430,16 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
             "nextRunAt": next_run,
             "lastFetchCount": last.fetched if last else 0,
             "totalFetched": sum(r.fetched for r in runs),
+            # See mail_agent's api.py for why this is `processed`, not `fetched`:
+            # "fetched" is the raw per-run scan count, which can re-scan the same
+            # window run after run with nothing new — "processed" is genuinely new.
+            "totalProcessed": sum(r.processed for r in runs),
             "totalHighRisk": sum(r.high_risk for r in runs),
         },
         "history": [
             {"runAt": r.run_at.isoformat(), "fetched": r.fetched, "processed": r.processed,
              "highRisk": r.high_risk, "status": r.status, "errorMessage": r.error_message}
-            for r in runs[:20]
+            for r in runs[:5]
         ],
         "daily": sorted(daily.values(), key=lambda d: d["day"])[-7:],
     }
