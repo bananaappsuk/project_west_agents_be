@@ -295,6 +295,7 @@ async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSessi
                             else f'High-priority: "{e.subject}"'),
                 "priority": e.priority,
                 "createdAt": e.received_at.isoformat() if e.received_at else None,
+                "archived": e.archived_at is not None,
             })
     return alerts
 
@@ -339,13 +340,18 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
             "nextRunAt": next_run,
             "lastFetchCount": last.fetched if last else 0,
             "totalFetched": sum(r.fetched for r in runs),
+            # "Messages processed" (see KpiCard on the dashboard) means genuinely new,
+            # deduped mail actually summarized — `fetched` is the raw per-run IMAP/Graph
+            # scan count and can legitimately re-scan the same mailbox window run after
+            # run without anything new arriving, so it isn't the right number to show.
+            "totalProcessed": sum(r.processed for r in runs),
             "totalHighPriority": sum(r.high_priority for r in runs),
         },
         "history": [
             {"runAt": r.run_at.isoformat(), "fetched": r.fetched, "processed": r.processed,
              "highPriority": r.high_priority, "archived": r.archived,
              "status": r.status, "errorMessage": r.error_message}
-            for r in runs[:20]
+            for r in runs[:5]
         ],
         "daily": sorted(daily.values(), key=lambda d: d["day"])[-7:],
     }
