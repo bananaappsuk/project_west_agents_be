@@ -15,6 +15,16 @@ from typing import NamedTuple
 
 log = logging.getLogger("mail_agent.mail_client")
 
+# stdlib's imaplib/smtplib default to no socket timeout — a connection attempt
+# to a host/port that's firewalled (silently dropped, not actively refused,
+# which is exactly how Railway and similar platforms often treat outbound
+# SMTP) hangs forever instead of raising. That hang then blocks the whole
+# background sync task indefinitely — is_running(org) never clears, and every
+# future sync for that org 409s as "already in progress" until the service is
+# restarted. A bounded timeout turns that into a normal, caught exception
+# (maybe_send in pipeline.py already falls back to a draft on any exception).
+_NET_TIMEOUT = 20
+
 
 class FetchResult(NamedTuple):
     messages: list[dict]
@@ -108,7 +118,7 @@ def fetch_latest(
     `count` slice, not after — belt-and-suspenders dedup independent of the
     watermark above, so a stale/incorrect `since_uid` can never cause a
     duplicate insert, only redundant work."""
-    conn = imaplib.IMAP4_SSL(imap_host, imap_port)
+    conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=_NET_TIMEOUT)
     try:
         conn.login(username, password)
         conn.select("INBOX")
@@ -166,7 +176,7 @@ def fetch_latest(
 
 
 def test_connection(*, imap_host: str, imap_port: int, username: str, password: str) -> None:
-    conn = imaplib.IMAP4_SSL(imap_host, imap_port)
+    conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=_NET_TIMEOUT)
     try:
         conn.login(username, password)
         conn.select("INBOX")
@@ -185,11 +195,11 @@ def send_reply(*, smtp_host: str, smtp_port: int, username: str, password: str,
     msg["Subject"] = subject
     msg.set_content(body)
     if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=_NET_TIMEOUT) as server:
             server.login(username, password)
             server.send_message(msg)
     else:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=_NET_TIMEOUT) as server:
             server.starttls(context=ssl.create_default_context())
             server.login(username, password)
             server.send_message(msg)
