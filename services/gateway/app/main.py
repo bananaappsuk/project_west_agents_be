@@ -38,7 +38,6 @@ ROUTES: list[tuple[str, str]] = sorted(
         ("/agent/", settings.mail_agent_url),   # /agent/status
         ("/voice", settings.voice_agent_url),   # all voice-agent endpoints: /voice/recordings, /voice/settings, …
         ("/agents", settings.agent_factory_url),  # /agents/{app}/{key}/invoke
-        ("/billing", settings.billing_url),     # /billing/entitlements, /billing/checkout-session, …
     ],
     key=lambda kv: len(kv[0]),
     reverse=True,

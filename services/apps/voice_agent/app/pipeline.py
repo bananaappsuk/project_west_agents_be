@@ -15,7 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, billing_client, bt_client, crm_sync, crypto, s3_client
+from . import agent_client, bt_client, crm_sync, crypto, s3_client
 from .db import SessionLocal
 from .models import AgentRun, Notification, Recording, VoiceSettings
 
@@ -37,22 +37,6 @@ _STUCK_PENDING_AFTER = timedelta(minutes=10)
 
 def is_running(org_id: str) -> bool:
     return org_id in _running
-
-
-def _duration_minutes(duration: str | None) -> float:
-    """Parses a stored "M:SS" (or "H:MM:SS") display string to minutes, for
-    billing's voice.minutes.month meter. Best-effort: an unparseable/blank
-    duration contributes 0 rather than raising."""
-    if not duration:
-        return 0.0
-    try:
-        parts = [int(p) for p in duration.split(":")]
-    except ValueError:
-        return 0.0
-    seconds = 0
-    for p in parts:
-        seconds = seconds * 60 + p
-    return seconds / 60
 
 
 async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:
@@ -92,11 +76,6 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
 
 
 async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
-    # Mirrors mail_agent's _run: checked here (not just in api.py's fetch_recordings)
-    # so a background-queued run started before an org's subscription lapsed still
-    # gets blocked once it actually executes, not just at the moment it was queued.
-    await billing_client.check_entitlement(org_id)
-
     # 1) short txn: read the org's connection settings for whichever source is active
     async with SessionLocal() as s:
         cfg = await s.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org_id))
@@ -263,9 +242,6 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
             source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
             s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
         await s.commit()
-
-    total_minutes = sum(_duration_minutes(payload_by_id[rid].get("duration")) for rid, _, ok in results if ok)
-    await billing_client.record_usage(org_id, total_minutes)
 
     log.info("run recorded: org=%s fetched=%d processed=%d high_risk=%d", org_id, len(recordings), len(new), high)
     return [rid for rid, _ in new]

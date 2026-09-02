@@ -7,8 +7,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import billing_client, crypto, graph_client, mail_client, pipeline
-from .billing_client import BillingBlocked
+from . import crypto, graph_client, mail_client, pipeline
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -67,12 +66,12 @@ async def fetch_emails(
 ):
     """Kicks off a fetch+analyze run in the background and returns immediately —
     a full sync can take minutes on a large mailbox (sequential LLM calls, 5 at a
-    time), far longer than any request should stay open. The billing/mailbox
-    checks below stay synchronous so the common failure cases still surface
-    immediately; the slow work is what moved to the background. Poll GET
-    /agent/status (its `running` flag, and each history entry's live progress
-    counters) to know how it's going — that's real server state, so it stays
-    correct no matter which page you're on.
+    time), far longer than any request should stay open. The mailbox check below
+    stays synchronous so the common failure case still surfaces immediately; the
+    slow work is what moved to the background. Poll GET /agent/status (its
+    `running` flag, and each history entry's live progress counters) to know how
+    it's going — that's real server state, so it stays correct no matter which
+    page you're on.
 
     `count=0` (the default) fetches *everything* not yet synced — a mailbox's
     first-ever sync naturally gets its whole history this way, and every sync
@@ -81,11 +80,6 @@ async def fetch_emails(
     watermark and rescans the whole mailbox from the start — a recovery/audit
     tool, not something a normal sync needs."""
     org = _org(claims)
-    try:
-        await billing_client.check_entitlement(org)
-    except BillingBlocked as exc:
-        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, {"code": exc.code, "message": str(exc)}) from exc
-
     mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == org))
     if not mailbox or not mailbox.enabled:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured for this org")

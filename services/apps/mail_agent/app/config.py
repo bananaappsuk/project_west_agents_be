@@ -10,11 +10,6 @@ class Settings(BaseServiceSettings):
     agent_factory_url: str = "http://localhost:8002"
     agent_factory_internal_key: str | None = None
 
-    # Billing entitlement checks + usage metering. Leave billing_url unset to skip
-    # both — the pipeline runs unmetered (fail-open), see billing_client.py.
-    billing_url: str | None = None
-    billing_internal_key: str | None = None
-
     cron_enabled: bool = True     # master switch for the background scheduler
     cron_tick_minutes: int = 5    # how often the scheduler checks each org's schedule
     fetch_per_run: int = 20

@@ -9,8 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import agent_client, billing_client, bt_client, crypto, pipeline, s3_client, transcribe
-from .billing_client import BillingBlocked
+from . import agent_client, bt_client, crypto, pipeline, s3_client, transcribe
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -119,11 +118,6 @@ async def fetch_recordings(
     (its `running` flag) to know when it's done — that's real server state, so it
     stays correct no matter which page you're on."""
     org = _org(claims)
-    try:
-        await billing_client.check_entitlement(org)
-    except BillingBlocked as exc:
-        raise HTTPException(status.HTTP_402_PAYMENT_REQUIRED, {"code": exc.code, "message": str(exc)}) from exc
-
     cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
     if not cfg or not cfg.enabled:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no recording source configured for this org")

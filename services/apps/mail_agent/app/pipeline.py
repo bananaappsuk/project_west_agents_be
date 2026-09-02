@@ -26,7 +26,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, billing_client, crm_sync, crypto, graph_client, mail_client
+from . import agent_client, crm_sync, crypto, graph_client, mail_client
 from .db import SessionLocal
 from .models import AgentConfig, AgentRun, Email, Mailbox
 from .schemas import serialize_email
@@ -252,7 +252,6 @@ async def analyze_and_persist(
 
     ok_count = sum(1 for _, _, ok, _ in sent_results if ok)
     all_ok = all(ok for _, _, ok, _ in sent_results)
-    await billing_client.record_usage(org_id, ok_count)
     return ok_count, high, all_ok
 
 
@@ -301,8 +300,6 @@ async def fetch_and_process(
     Only the most recent `_AUTO_ANALYZE_COUNT` imported-but-unanalyzed emails
     get an AI summary automatically — see this module's docstring for why.
 
-    Raises BillingBlocked (before any IMAP/SMTP work happens) if the org's
-    subscription is inactive or this month's analysis quota is used up.
     Raises RuntimeError if a run for this org is already in progress.
 
     Runs as a background task (see api.py's /emails/fetch) rather than being
@@ -357,8 +354,6 @@ async def _known_uids(org_id: str, uid_validity: str | None) -> set[str]:
 
 
 async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_id: str) -> list[str]:
-    await billing_client.check_entitlement(org_id)
-
     # 1) short txn: read mailbox creds + org config + the sync watermark
     async with SessionLocal() as s:
         mailbox = await s.scalar(select(Mailbox).where(Mailbox.org_id == org_id))
