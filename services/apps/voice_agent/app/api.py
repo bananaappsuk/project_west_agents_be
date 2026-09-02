@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import agent_client, bt_client, crypto, pipeline, s3_client, transcribe
@@ -79,7 +79,14 @@ async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSessi
     """Mirrors mail_agent's GET /alerts: high-priority and high-risk calls, not a
     separate table — recomputed from the recordings themselves each time so it can
     never drift from what /voice/recordings actually shows."""
-    rows = await session.scalars(select(Recording).where(Recording.org_id == _org(claims)))
+    # Filter in SQL rather than pulling every recording (transcript/summary/
+    # ai_reply included) over the wire just to discard most of them in Python.
+    rows = await session.scalars(
+        select(Recording).where(
+            Recording.org_id == _org(claims),
+            or_(Recording.priority == "High", Recording.risk == "High"),
+        )
+    )
     alerts = []
     for r in rows:
         is_high_risk = r.risk == "High"
@@ -270,7 +277,15 @@ async def send_reply(rec_id: str, claims: dict = Depends(require(WRITE)), sessio
 @router.get("/stats")
 async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     org = _org(claims)
-    rows = list(await session.scalars(select(Recording).where(Recording.org_id == org)))
+    # Only the small classification columns these counts need — not full rows,
+    # which would drag every recording's transcript/summary/ai_reply (the
+    # largest columns in the schema) over the wire just to tally counters.
+    rows = list(await session.execute(
+        select(
+            Recording.status, Recording.reply_status, Recording.risk,
+            Recording.category, Recording.sentiment, Recording.agent,
+        ).where(Recording.org_id == org)
+    ))
     cfg = await _get_config(session, org)
 
     categories = ["Sales Enquiry", "Complaint", "Support", "Booking", "Billing", "General Enquiry"]
