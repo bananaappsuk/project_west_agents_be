@@ -26,12 +26,28 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, crm_sync, crypto, graph_client, mail_client
+from . import agent_client, crm_sync, crypto, graph_client, mail_client, sendgrid_client
+from .config import settings
 from .db import SessionLocal
 from .models import AgentConfig, AgentRun, Email, Mailbox
 from .schemas import serialize_email
 
 log = logging.getLogger("mail_agent.pipeline")
+
+
+def _send_fn_for(provider: str):
+    """Which client actually delivers a reply — shared by the auto-send path
+    below and api.py's manual "Reply" button, so both make the same choice.
+    Graph orgs always send via Graph (HTTP, already unaffected). IMAP orgs send
+    via SendGrid's HTTP API instead of raw SMTP when configured, since raw SMTP
+    can't succeed on a platform that doesn't route outbound SMTP traffic at all
+    (see sendgrid_client.py) — falls back to raw SMTP when SendGrid isn't
+    configured, for hosts where SMTP does work (e.g. local dev)."""
+    if provider == "graph":
+        return graph_client.send_reply
+    if settings.sendgrid_api_key:
+        return sendgrid_client.send_reply
+    return mail_client.send_reply
 
 # In-memory guard against two overlapping runs for the same org — a manual "Run
 # now"/"Summarize previous 100" click and a cron tick landing at the same
@@ -178,7 +194,7 @@ async def analyze_and_persist(
     # serialized payloads already carry fromEmail/subject, so this needs no
     # extra DB read.
     payload_by_id = {eid: p for eid, p in rows}
-    send_fn = graph_client.send_reply if provider == "graph" else mail_client.send_reply
+    send_fn = _send_fn_for(provider)
 
     async def maybe_send(email_id: str, a: dict, auto_sendable: bool, ok: bool) -> tuple[str, dict, bool, bool]:
         if not (ok and auto_reply_enabled and auto_sendable and a.get("needs_reply")):

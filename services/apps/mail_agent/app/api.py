@@ -157,29 +157,26 @@ async def send_reply(email_id: str, body: ReplyIn, claims: dict = Depends(requir
     mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == _org(claims)))
     if not mailbox:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
+    send_fn = pipeline._send_fn_for(mailbox.provider)
+    send_creds = (
+        {
+            "tenant_id": mailbox.tenant_id,
+            "client_id": mailbox.client_id,
+            "client_secret": crypto.decrypt(mailbox.client_secret_enc),
+            "mailbox": mailbox.username,
+        }
+        if mailbox.provider == "graph"
+        else {
+            "smtp_host": mailbox.smtp_host,
+            "smtp_port": mailbox.smtp_port,
+            "username": mailbox.username,
+            "password": crypto.decrypt(mailbox.password_enc),
+        }
+    )
     try:
-        if mailbox.provider == "graph":
-            await run_in_threadpool(
-                graph_client.send_reply,
-                tenant_id=mailbox.tenant_id,
-                client_id=mailbox.client_id,
-                client_secret=crypto.decrypt(mailbox.client_secret_enc),
-                mailbox=mailbox.username,
-                to_addr=e.from_email,
-                subject=f"Re: {e.subject}",
-                body=body.body,
-            )
-        else:
-            await run_in_threadpool(
-                mail_client.send_reply,
-                smtp_host=mailbox.smtp_host,
-                smtp_port=mailbox.smtp_port,
-                username=mailbox.username,
-                password=crypto.decrypt(mailbox.password_enc),
-                to_addr=e.from_email,
-                subject=f"Re: {e.subject}",
-                body=body.body,
-            )
+        await run_in_threadpool(
+            send_fn, **send_creds, to_addr=e.from_email, subject=f"Re: {e.subject}", body=body.body,
+        )
     except Exception as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"send failed: {exc}") from exc
     e.reply_status = "sent"

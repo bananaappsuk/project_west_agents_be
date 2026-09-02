@@ -21,5 +21,17 @@ class Settings(BaseServiceSettings):
     crm_client_id: str = ""
     crm_api_key: str = ""
 
+    # SendGrid — replaces raw SMTP for sending replies on IMAP-provider mailboxes
+    # when set (see sendgrid_client.py / pipeline.py's _send_fn_for). Needed on
+    # Railway specifically: its network doesn't route outbound SMTP at all
+    # (confirmed live: connecting to smtp.gmail.com:587 fails immediately with
+    # "[Errno 101] Network is unreachable"), so raw SMTP can never succeed there
+    # regardless of credentials. SendGrid is plain HTTPS, unaffected. Leave unset
+    # to keep using raw SMTP (e.g. for local dev, where it does work).
+    # sendgrid_from_email must be a Single Sender verified in the SendGrid
+    # dashboard — SendGrid rejects sends from an unverified address.
+    sendgrid_api_key: str | None = None
+    sendgrid_from_email: str | None = None
+
 
 settings = Settings()
