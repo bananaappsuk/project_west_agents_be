@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 
 from . import crm_client
 from .config import settings
-from .models import Email
 
 log = logging.getLogger("mail_agent.crm_sync")
 
@@ -50,8 +49,18 @@ async def _upload_attachments(attachments: list[dict]) -> list[dict]:
     return out
 
 
-async def after_email_analysis(email: Email, analysis: dict, attachments: list[dict] | None = None) -> tuple[str, str | None]:
-    """Returns (crm_status, crm_reference). crm_status is "none" | "sent" | "skipped" | "failed"."""
+async def after_email_analysis(
+    email_payload: dict, analysis: dict, attachments: list[dict] | None = None
+) -> tuple[str, str | None]:
+    """Returns (crm_status, crm_reference). crm_status is "none" | "sent" | "skipped" | "failed".
+
+    Takes the same serialized dict (schemas.serialize_email) pipeline.py already
+    carries around for the LLM call, rather than the live `Email` ORM row —
+    deliberately: this function makes slow HTTP calls (attachment upload,
+    referral/communication submission), and taking a plain dict instead of an
+    attached ORM object means the caller can run it fully outside any open DB
+    transaction/session (see pipeline.py's analyze_and_persist), never holding a
+    pooled connection for however long the CRM API takes to respond."""
     if not settings.crm_enabled:
         return "none", None
 
@@ -59,25 +68,31 @@ async def after_email_analysis(email: Email, analysis: dict, attachments: list[d
     if intent == "NONE":
         return "none", None
 
+    uid = email_payload.get("uid")
+    subject = email_payload.get("subject")
+    sender = email_payload.get("from")
+    from_email = email_payload.get("fromEmail")
+    received_at = email_payload.get("receivedAt")  # already an ISO string, or None
+
     uploaded = await _upload_attachments(attachments or [])
 
     try:
         if intent == "REFERRAL":
             payload = {
                 "channel": "EMAIL_AGENT",
-                "idempotency_key": email.uid,
-                "referrer_name": analysis.get("referrer_name") or email.sender,
-                "referrer_email": email.from_email,
+                "idempotency_key": uid,
+                "referrer_name": analysis.get("referrer_name") or sender,
+                "referrer_email": from_email,
                 "referrer_type": _enum_or_none(analysis.get("referrer_type") or "SELF", _REFERRER_TYPES) or "SELF",
                 "service_requested": _enum_or_none(analysis.get("service_requested") or "", _SERVICE_TYPES),
-                "help_needed": analysis.get("help_needed") or email.subject or "Referral request",
+                "help_needed": analysis.get("help_needed") or subject or "Referral request",
                 # children/attachments are plain (non-nullable) lists on the CRM's schema —
                 # an empty list is the correct "none" value, never a JSON null.
                 "children": analysis.get("children") or [],
                 "child_lives_with": analysis.get("child_lives_with") or None,
                 "requesting_adult_name": analysis.get("requesting_adult_name") or None,
                 "relationship_to_child": analysis.get("relationship_to_child") or None,
-                "source_payload": {"raw_email_subject": email.subject, "thread_id": email.uid},
+                "source_payload": {"raw_email_subject": subject, "thread_id": uid},
                 "attachments": uploaded,
             }
             res = await crm_client.submit_referral(payload)
@@ -86,10 +101,10 @@ async def after_email_analysis(email: Email, analysis: dict, attachments: list[d
         if intent in _COMMUNICATION_INTENTS:
             case_ref = analysis.get("case_ref") or ""
             if not case_ref:
-                log.info("communication skipped, no case_ref found: email uid=%s", email.uid)
+                log.info("communication skipped, no case_ref found: email uid=%s", uid)
                 return "skipped", None
             if intent in ("RESCHEDULE", "CANCEL") and not (analysis.get("meeting_reference") or ""):
-                log.info("change request skipped, no meeting_reference found: email uid=%s", email.uid)
+                log.info("change request skipped, no meeting_reference found: email uid=%s", uid)
                 return "skipped", None
 
             payload = {
@@ -99,14 +114,14 @@ async def after_email_analysis(email: Email, analysis: dict, attachments: list[d
                 "category": "CANCELLATION" if intent in ("RESCHEDULE", "CANCEL") else "GENERAL",
                 # occurred_at is required by the CRM's schema — fall back to "now" for the
                 # rare message with no parseable Date header rather than send a null.
-                "occurred_at": (email.received_at or datetime.now(timezone.utc)).isoformat(),
-                "subject": email.subject,
-                "summary": analysis.get("summary") or email.subject or "",
-                "participant_name": email.sender,
-                "participant_address": email.from_email,
+                "occurred_at": received_at or datetime.now(timezone.utc).isoformat(),
+                "subject": subject,
+                "summary": analysis.get("summary") or subject or "",
+                "participant_name": sender,
+                "participant_address": from_email,
                 "attachments": uploaded,
-                "external_ref": email.uid,
-                "source_payload": {"thread_id": email.uid},
+                "external_ref": uid,
+                "source_payload": {"thread_id": uid},
             }
             if intent in ("RESCHEDULE", "CANCEL"):
                 payload["meeting_reference"] = analysis["meeting_reference"]
@@ -118,5 +133,5 @@ async def after_email_analysis(email: Email, analysis: dict, attachments: list[d
 
         return "none", None
     except Exception as exc:
-        log.warning("CRM submission failed: email uid=%s intent=%s: %s", email.uid, intent, exc)
+        log.warning("CRM submission failed: email uid=%s intent=%s: %s", uid, intent, exc)
         return "failed", None

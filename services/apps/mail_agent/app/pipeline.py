@@ -198,6 +198,24 @@ async def analyze_and_persist(
 
     sent_results = await asyncio.gather(*(maybe_send(eid, a, auto_sendable, ok) for eid, a, auto_sendable, ok in results))
 
+    # CRM forwarding — also NO DB connection held, same principle as analyze/
+    # maybe_send above. A referral/communication submission (plus any attachment
+    # upload ahead of it) is an HTTP call that can take seconds; running it here
+    # rather than inside the persist transaction below means a slow or failing
+    # CRM call can never hold a pooled connection open or roll back rows that
+    # already finished processing.
+    async def do_crm(email_id: str, a: dict, ok: bool) -> tuple[str, str, str | None]:
+        if not ok:
+            return email_id, "none", None
+        async with sem:
+            status, ref = await crm_sync.after_email_analysis(
+                payload_by_id[email_id], a, (attachments_by_id or {}).get(email_id)
+            )
+            return email_id, status, ref
+
+    crm_results = await asyncio.gather(*(do_crm(eid, a, ok) for eid, a, ok, _sent in sent_results))
+    crm_by_id = {eid: (status, ref) for eid, status, ref in crm_results}
+
     high = 0
     async with SessionLocal() as s:
         for email_id, a, ok, sent in sent_results:
@@ -213,9 +231,7 @@ async def analyze_and_persist(
                 e.summary_status = "done"
                 if e.priority == "High":
                     high += 1
-                e.crm_status, e.crm_reference = await crm_sync.after_email_analysis(
-                    e, a, (attachments_by_id or {}).get(email_id)
-                )
+                e.crm_status, e.crm_reference = crm_by_id.get(email_id, ("none", None))
 
                 suggested_reply = a.get("suggested_reply", "") or ""
                 if not e.needs_reply:
@@ -322,9 +338,22 @@ async def fetch_and_process(
         _running.discard(org_id)
 
 
-async def _known_uids(org_id: str) -> set[str]:
+async def _known_uids(org_id: str, uid_validity: str | None) -> set[str]:
+    """UIDs already stored for this org, scoped to the *current* UID epoch
+    (`uid_validity`) plus any legacy rows that pre-date the uid_validity column
+    (NULL — those never had an epoch recorded, so they're included unconditionally
+    as a conservative belt-and-suspenders: excluding them could only ever risk a
+    duplicate insert of already-known mail, never a silent loss). Scoping by
+    epoch is what lets a genuinely new message reuse a UID number a *prior* IMAP
+    UIDVALIDITY era already used without being wrongly treated as a duplicate —
+    see models.py's Email.uid_validity."""
     async with SessionLocal() as s:
-        return set(await s.scalars(select(Email.uid).where(Email.org_id == org_id)))
+        return set(await s.scalars(
+            select(Email.uid).where(
+                Email.org_id == org_id,
+                or_(Email.uid_validity == uid_validity, Email.uid_validity.is_(None)),
+            )
+        ))
 
 
 async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_id: str) -> list[str]:
@@ -371,6 +400,13 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
         # requested) — nothing to narrow by, so the first batch below naturally
         # pulls from the very start of the mailbox's history.
 
+        # The UID epoch dedup is currently scoped to (see _known_uids/Email.uid_validity).
+        # Graph ids need no epoch tracking — "graph" is a fixed sentinel, never reset.
+        # For IMAP, None means no baseline established yet (first sync since this
+        # column was added, or ever); the batch loop below adopts whatever the
+        # server reports as the baseline the first time it sees one.
+        current_uid_validity = "graph" if provider == "graph" else mailbox.uid_validity
+
     sem = asyncio.Semaphore(_ANALYZE_CONCURRENCY)
     all_new_ids: list[str] = []
     total_fetched = total_processed = total_archived = 0
@@ -385,16 +421,41 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
     while True:
         batch_num += 1
         batch_cap = min(count, _BATCH_SIZE) if count else _BATCH_SIZE
-        known_uids = await _known_uids(org_id)
+        known_uids = await _known_uids(org_id, current_uid_validity)
 
         if provider == "graph":
             messages, watermark_advance = await run_in_threadpool(
                 graph_client.fetch_latest, count=batch_cap, known_uids=known_uids, since_at=since_at, **creds
             )
         else:
-            messages, watermark_advance = await run_in_threadpool(
+            messages, watermark_advance, fetched_uid_validity = await run_in_threadpool(
                 mail_client.fetch_latest, count=batch_cap, known_uids=known_uids, since_uid=since_uid, **creds
             )
+            if current_uid_validity is not None and fetched_uid_validity and fetched_uid_validity != current_uid_validity:
+                # A real IMAP UIDVALIDITY reset (mailbox rebuild/migration on the
+                # server) — UID numbers started over, so `since_uid` (scoped to the
+                # *old* numbering) is now meaningless, and this batch's `messages`
+                # were fetched using it, so they can't be trusted either. Adopt the
+                # new epoch, persist it + clear the watermark immediately (so a
+                # crash right after this doesn't lose the update), and restart the
+                # loop to refetch cleanly from the start of the new epoch.
+                log.warning(
+                    "org=%s: IMAP UIDVALIDITY changed (%s -> %s) — mailbox UID numbering was "
+                    "reset server-side; resetting the sync watermark and starting a fresh UID "
+                    "epoch so a reused UID is never mistaken for an already-imported message",
+                    org_id, current_uid_validity, fetched_uid_validity,
+                )
+                current_uid_validity = fetched_uid_validity
+                since_uid = None
+                async with SessionLocal() as s:
+                    mb = await s.get(Mailbox, mailbox_id)
+                    if mb:
+                        mb.uid_validity = current_uid_validity
+                        mb.last_synced_uid = None
+                    await s.commit()
+                continue
+            if fetched_uid_validity and current_uid_validity is None:
+                current_uid_validity = fetched_uid_validity  # first baseline for this mailbox
         log.info("org=%s batch=%d: pulled %d message(s)", org_id, batch_num, len(messages))
         if not messages:
             break
@@ -419,7 +480,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                     .where(Email.org_id == org_id, Email.archived_at.is_(None))
                     .values(archived_at=now, archived_by="cron")
                 )
-                total_archived = result.rowcount or 0
+                total_archived = max(result.rowcount, 0)
                 swept = True
                 if total_archived:
                     log.info("sweep: archived %d prior email(s)", total_archived)
@@ -432,7 +493,8 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                     # iframe — defense in depth against a malicious sender's HTML.
                     body = nh3.clean(body)
                 row = Email(
-                    org_id=org_id, uid=m["uid"], sender=m["from"], from_email=m["fromEmail"],
+                    org_id=org_id, uid=m["uid"], uid_validity=current_uid_validity,
+                    sender=m["from"], from_email=m["fromEmail"],
                     subject=m["subject"], body=body, content_type=content_type,
                     received_at=m["receivedAt"], summary_status="skipped",
                 )
@@ -454,6 +516,8 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                 if not mb.last_synced_uid or int(watermark_advance) > int(mb.last_synced_uid):
                     mb.last_synced_uid = watermark_advance
                 since_uid = mb.last_synced_uid
+                if current_uid_validity:
+                    mb.uid_validity = current_uid_validity
 
             run = await s.get(AgentRun, run_id)
             if run:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import email
 import imaplib
+import logging
 import smtplib
 import ssl
 from datetime import timezone
@@ -11,6 +12,8 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import NamedTuple
+
+log = logging.getLogger("mail_agent.mail_client")
 
 
 class FetchResult(NamedTuple):
@@ -22,6 +25,10 @@ class FetchResult(NamedTuple):
     # transient single-message fetch failure doesn't get silently re-attempted
     # forever either.
     max_uid_seen: str | None
+    # The mailbox's current IMAP UIDVALIDITY (see models.py's Email.uid_validity
+    # for why the caller cares) — the server reports this on every SELECT, not
+    # just the first one, so the caller can detect a reset on any batch.
+    uid_validity: str | None
 
 
 def _decode(value: str | None) -> str:
@@ -105,6 +112,11 @@ def fetch_latest(
     try:
         conn.login(username, password)
         conn.select("INBOX")
+        # The server reports UIDVALIDITY as an untagged response during SELECT;
+        # imaplib captures it and makes it available via response(). Not every
+        # server necessarily sends it, so this can legitimately come back empty.
+        _, uidval_data = conn.response("UIDVALIDITY")
+        uid_validity = uidval_data[0].decode() if uidval_data and uidval_data[0] else None
         criteria = f"UID {int(since_uid) + 1}:*" if since_uid else "ALL"
         _, data = conn.uid("search", None, criteria)
         uids = data[0].split()  # ascending order per IMAP convention
@@ -115,29 +127,37 @@ def fetch_latest(
         max_uid_seen = max((u.decode() for u in uids), key=int, default=None)
         out: list[dict] = []
         for uid in uids:
-            _, msg_data = conn.uid("fetch", uid, "(RFC822)")
-            if not msg_data or not msg_data[0]:
-                continue
-            msg = email.message_from_bytes(msg_data[0][1])
-            name, addr = parseaddr(msg.get("From", ""))
+            # One malformed/adversarial message must never sink the whole batch —
+            # `max_uid_seen` above already covers the watermark for everything
+            # *examined* here regardless of per-message outcome, so skipping a
+            # message that fails to parse just means it's silently absent rather
+            # than blocking every UID after it on every retry.
             try:
-                received = parsedate_to_datetime(msg.get("Date"))
-                if received and received.tzinfo is None:
-                    received = received.replace(tzinfo=timezone.utc)
-            except Exception:
-                received = None
-            body, content_type = _extract_body(msg)
-            out.append({
-                "uid": uid.decode(),
-                "from": _decode(name) or addr,
-                "fromEmail": addr,
-                "subject": _decode(msg.get("Subject", "")),
-                "body": body,
-                "contentType": content_type,
-                "receivedAt": received,
-                "attachments": _extract_attachments(msg),
-            })
-        return FetchResult(out, max_uid_seen)
+                _, msg_data = conn.uid("fetch", uid, "(RFC822)")
+                if not msg_data or not msg_data[0]:
+                    continue
+                msg = email.message_from_bytes(msg_data[0][1])
+                name, addr = parseaddr(msg.get("From", ""))
+                try:
+                    received = parsedate_to_datetime(msg.get("Date"))
+                    if received and received.tzinfo is None:
+                        received = received.replace(tzinfo=timezone.utc)
+                except Exception:
+                    received = None
+                body, content_type = _extract_body(msg)
+                out.append({
+                    "uid": uid.decode(),
+                    "from": _decode(name) or addr,
+                    "fromEmail": addr,
+                    "subject": _decode(msg.get("Subject", "")),
+                    "body": body,
+                    "contentType": content_type,
+                    "receivedAt": received,
+                    "attachments": _extract_attachments(msg),
+                })
+            except Exception as exc:
+                log.warning("fetch/parse FAILED for uid=%s, skipping: %s", uid, exc)
+        return FetchResult(out, max_uid_seen, uid_validity)
     finally:
         try:
             conn.logout()

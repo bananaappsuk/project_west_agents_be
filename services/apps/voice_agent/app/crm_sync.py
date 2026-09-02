@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 
 from . import crm_client
 from .config import settings
-from .models import Recording
 
 log = logging.getLogger("voice_agent.crm_sync")
 
@@ -50,8 +49,15 @@ def _duration_seconds(duration: str) -> int | None:
     return seconds
 
 
-async def after_call_analysis(recording: Recording, analysis: dict) -> tuple[str, str | None]:
-    """Returns (crm_status, crm_reference). crm_status is "none" | "sent" | "skipped" | "failed"."""
+async def after_call_analysis(recording_payload: dict, analysis: dict) -> tuple[str, str | None]:
+    """Returns (crm_status, crm_reference). crm_status is "none" | "sent" | "skipped" | "failed".
+
+    Takes a plain dict (the same one pipeline.py already carries around for the
+    LLM call, plus ext_id/call_date) rather than the live `Recording` ORM row —
+    deliberately: this makes an HTTP call to the CRM, and taking a dict instead
+    of an attached ORM object means the caller can run it fully outside any open
+    DB transaction/session (see pipeline.py's `_run`), never holding a pooled
+    connection open for however long the CRM API takes to respond."""
     if not settings.crm_enabled:
         return "none", None
 
@@ -59,13 +65,20 @@ async def after_call_analysis(recording: Recording, analysis: dict) -> tuple[str
     if intent == "NONE":
         return "none", None
 
+    ext_id = recording_payload.get("ext_id")
+    caller = recording_payload.get("caller")
+    phone = recording_payload.get("phone")
+    agent = recording_payload.get("agent")
+    call_date = recording_payload.get("call_date")
+    duration = recording_payload.get("duration")
+
     try:
         if intent == "REFERRAL":
             payload = {
                 "channel": "VOICE_AGENT",
-                "idempotency_key": recording.ext_id,
-                "referrer_name": analysis.get("referrer_name") or recording.caller,
-                "referrer_phone": recording.phone,
+                "idempotency_key": ext_id,
+                "referrer_name": analysis.get("referrer_name") or caller,
+                "referrer_phone": phone,
                 "referrer_type": _enum_or_none(analysis.get("referrer_type") or "SELF", _REFERRER_TYPES) or "SELF",
                 "service_requested": _enum_or_none(analysis.get("service_requested") or "", _SERVICE_TYPES),
                 "help_needed": analysis.get("help_needed") or analysis.get("summary") or "Referral request",
@@ -75,7 +88,7 @@ async def after_call_analysis(recording: Recording, analysis: dict) -> tuple[str
                 "child_lives_with": analysis.get("child_lives_with") or None,
                 "requesting_adult_name": analysis.get("requesting_adult_name") or None,
                 "relationship_to_child": analysis.get("relationship_to_child") or None,
-                "source_payload": {"call_ext_id": recording.ext_id, "handled_by": recording.agent},
+                "source_payload": {"call_ext_id": ext_id, "handled_by": agent},
             }
             res = await crm_client.submit_referral(payload)
             return "sent", res.get("reference")
@@ -83,18 +96,18 @@ async def after_call_analysis(recording: Recording, analysis: dict) -> tuple[str
         if intent in _COMMUNICATION_INTENTS:
             case_ref = analysis.get("case_ref") or ""
             if not case_ref:
-                log.info("communication skipped, no case_ref found: recording ext_id=%s", recording.ext_id)
+                log.info("communication skipped, no case_ref found: recording ext_id=%s", ext_id)
                 return "skipped", None
             if intent in ("RESCHEDULE", "CANCEL") and not (analysis.get("meeting_reference") or ""):
-                log.info("change request skipped, no meeting_reference found: recording ext_id=%s", recording.ext_id)
+                log.info("change request skipped, no meeting_reference found: recording ext_id=%s", ext_id)
                 return "skipped", None
 
-            # Recording.call_date is a date only (no time-of-day is captured upstream);
-            # midnight UTC is an approximation, not the actual call time. occurred_at is
-            # required by the CRM's schema, so fall back to "now" if call_date is somehow
-            # blank rather than send a null.
+            # call_date is a date only (no time-of-day is captured upstream); midnight
+            # UTC is an approximation, not the actual call time. occurred_at is
+            # required by the CRM's schema, so fall back to "now" if call_date is
+            # somehow blank rather than send a null.
             occurred_at = (
-                f"{recording.call_date}T00:00:00Z" if recording.call_date
+                f"{call_date}T00:00:00Z" if call_date
                 else datetime.now(timezone.utc).isoformat()
             )
             payload = {
@@ -104,11 +117,11 @@ async def after_call_analysis(recording: Recording, analysis: dict) -> tuple[str
                 "category": "CANCELLATION" if intent in ("RESCHEDULE", "CANCEL") else "GENERAL",
                 "occurred_at": occurred_at,
                 "summary": analysis.get("summary") or "",
-                "duration_seconds": _duration_seconds(recording.duration),
-                "participant_name": recording.caller,
-                "participant_address": recording.phone,
-                "external_ref": recording.ext_id,
-                "source_payload": {"handled_by": recording.agent},
+                "duration_seconds": _duration_seconds(duration),
+                "participant_name": caller,
+                "participant_address": phone,
+                "external_ref": ext_id,
+                "source_payload": {"handled_by": agent},
             }
             if intent in ("RESCHEDULE", "CANCEL"):
                 payload["meeting_reference"] = analysis["meeting_reference"]
@@ -120,5 +133,5 @@ async def after_call_analysis(recording: Recording, analysis: dict) -> tuple[str
 
         return "none", None
     except Exception as exc:
-        log.warning("CRM submission failed: recording ext_id=%s intent=%s: %s", recording.ext_id, intent, exc)
+        log.warning("CRM submission failed: recording ext_id=%s intent=%s: %s", ext_id, intent, exc)
         return "failed", None

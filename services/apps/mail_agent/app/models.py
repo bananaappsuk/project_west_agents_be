@@ -27,7 +27,18 @@ class Email(Base):
     __tablename__ = "emails"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
     org_id: Mapped[str] = mapped_column(String, index=True)
-    uid: Mapped[str] = mapped_column(String)  # IMAP UID — dedup key within an org
+    uid: Mapped[str] = mapped_column(String)  # IMAP UID (or Graph message id) — dedup key within an org
+    # The IMAP UIDVALIDITY in effect when `uid` was assigned, or the fixed
+    # sentinel "graph" for Graph-provider rows (Graph ids are already globally
+    # stable, no reset concept). Part of the dedup identity alongside `uid`
+    # (see __table_args__ below) — if a mailbox's UIDVALIDITY ever resets (a
+    # real IMAP event: mailbox rebuild/migration), UID numbers start over from
+    # the server's perspective, so a genuinely new message can be assigned a UID
+    # a prior email already used. Without this column that collided with the
+    # dedup check and got silently dropped as "already synced"; with it, the two
+    # eras never compare equal. NULL means "pre-dates this column" (migrated-in
+    # legacy rows) — see pipeline.py's _known_uids for how those are handled.
+    uid_validity: Mapped[str | None] = mapped_column(String, nullable=True)
     sender: Mapped[str] = mapped_column(String)         # display name -> JSON "from"
     from_email: Mapped[str] = mapped_column(String)     # -> "fromEmail"
     subject: Mapped[str] = mapped_column(String, default="")
@@ -53,7 +64,7 @@ class Email(Base):
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     archived_by: Mapped[str | None] = mapped_column(String, nullable=True)  # cron | user
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (UniqueConstraint("org_id", "uid", name="uq_email_org_uid"),)
+    __table_args__ = (UniqueConstraint("org_id", "uid_validity", "uid", name="uq_email_org_uidvalidity_uid"),)
 
 
 class Folder(Base):
@@ -103,10 +114,14 @@ class Mailbox(Base):
     # NULL means "never synced" — the *first* sync for a mailbox therefore
     # naturally pulls everything, however large the backlog. Purely a scope
     # optimization for the SEARCH/query the provider runs, never the source of
-    # truth for dedup — Email.uid's unique constraint still guards against a
-    # duplicate insert even if this drifts (e.g. IMAP UIDVALIDITY changing).
+    # truth for dedup — Email's (org_id, uid_validity, uid) unique constraint
+    # guards against a duplicate insert even if this drifts.
     last_synced_uid: Mapped[str | None] = mapped_column(String, nullable=True)   # IMAP
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # Graph
+    # The IMAP UIDVALIDITY last observed for this mailbox (see Email.uid_validity
+    # for why this matters) — NULL until the first sync after this column was
+    # added establishes a baseline. Not used for Graph mailboxes.
+    uid_validity: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class AgentConfig(Base):
