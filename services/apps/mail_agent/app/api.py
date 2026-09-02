@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import billing_client, crypto, graph_client, mail_client, pipeline
@@ -282,7 +282,15 @@ async def delete_folder(folder_id: str, claims: dict = Depends(require(WRITE)), 
 # ---------- alerts ----------
 @router.get("/alerts")
 async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    rows = await session.scalars(select(Email).where(Email.org_id == _org(claims)))
+    # Filter in SQL rather than pulling every email (body/summary/draft_reply
+    # included) over the wire just to discard most of them in Python — only
+    # High-priority/Security rows are ever returned here.
+    rows = await session.scalars(
+        select(Email).where(
+            Email.org_id == _org(claims),
+            or_(Email.priority == "High", Email.category == "Security"),
+        )
+    )
     alerts = []
     for e in rows:
         is_security = e.category == "Security"

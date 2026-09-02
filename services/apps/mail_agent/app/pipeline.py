@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 import nh3
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
+from sqlalchemy import update as sa_update
 
 from . import agent_client, billing_client, crypto, graph_client, mail_client
 from .db import SessionLocal
@@ -386,21 +387,28 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
 
         new: list[str] = []
         async with SessionLocal() as s:
-            fresh = [
-                m for m in messages
-                if not await s.scalar(select(Email).where(Email.org_id == org_id, Email.uid == m["uid"]))
-            ]
+            # Dedup against the same `known_uids` already fetched once above (and
+            # already handed to the provider to skip) instead of a per-message
+            # SELECT round trip — this loop used to issue one query per message
+            # in the batch for what `known_uids` already tells us in memory.
+            fresh = [m for m in messages if m["uid"] not in known_uids]
 
             if sweep and fresh and not swept:
                 now = datetime.now(timezone.utc)
-                prior = list(await s.scalars(select(Email).where(Email.org_id == org_id, Email.archived_at.is_(None))))
-                for e in prior:
-                    e.archived_at = now
-                    e.archived_by = "cron"
-                total_archived = len(prior)
+                # A bulk UPDATE, not a SELECT-then-mutate — the earlier ORM-load
+                # form (`select(Email)...`) pulled every prior email's full body/
+                # summary/draft_reply text over the wire just to flip two flags,
+                # which is what was blowing through Neon's data-transfer quota on
+                # every sweep. This flips the flags in the DB directly.
+                result = await s.execute(
+                    sa_update(Email)
+                    .where(Email.org_id == org_id, Email.archived_at.is_(None))
+                    .values(archived_at=now, archived_by="cron")
+                )
+                total_archived = result.rowcount or 0
                 swept = True
-                if prior:
-                    log.info("sweep: archived %d prior email(s)", len(prior))
+                if total_archived:
+                    log.info("sweep: archived %d prior email(s)", total_archived)
 
             for m in fresh:
                 content_type = m.get("contentType", "text")

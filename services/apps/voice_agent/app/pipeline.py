@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 
 from . import agent_client, bt_client, crypto, s3_client
 from .db import SessionLocal
@@ -117,13 +118,17 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
         ]
 
         if sweep and fresh:
-            prior = list(await s.scalars(
-                select(Recording).where(Recording.org_id == org_id, Recording.status == "new")
-            ))
-            for r in prior:
-                r.status = "old"
-            if prior:
-                log.info("sweep: moved %d recording(s) new -> old", len(prior))
+            # A bulk UPDATE, not a SELECT-then-mutate — the earlier ORM-load form
+            # pulled every "new" recording's full transcript/summary/ai_reply text
+            # over the wire just to flip one status column, which is what was
+            # driving up Neon's data-transfer usage on every sweep.
+            result = await s.execute(
+                sa_update(Recording)
+                .where(Recording.org_id == org_id, Recording.status == "new")
+                .values(status="old")
+            )
+            if result.rowcount:
+                log.info("sweep: moved %d recording(s) new -> old", result.rowcount)
 
         for m in fresh:
             row = Recording(
