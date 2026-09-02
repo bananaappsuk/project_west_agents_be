@@ -231,6 +231,7 @@ async def analyze_and_persist(
                 e.summary_status = "done"
                 if e.priority == "High":
                     high += 1
+                e.intent = a.get("intent") or "NONE"
                 e.crm_status, e.crm_reference = crm_by_id.get(email_id, ("none", None))
 
                 suggested_reply = a.get("suggested_reply", "") or ""

@@ -57,6 +57,7 @@ class Email(Base):
     reply_status: Mapped[str] = mapped_column(String, default="none")       # none|draft|sent|rejected
     auto_sent: Mapped[bool] = mapped_column(Boolean, default=False)         # sent by the AI, not a human
     # CRM intake (pw-crm-be) outcome for this email's detected intent, if any.
+    intent: Mapped[str] = mapped_column(String, default="NONE")  # REFERRAL|CASE_COMMUNICATION|RESCHEDULE|CANCEL|NONE
     crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
     crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref
     # buckets / lifecycle
