@@ -10,7 +10,6 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..billing_client import start_trial
 from ..config import settings
 from ..db import get_session
 from ..deps import current_claims
@@ -22,7 +21,6 @@ from ..schemas import (
     LoginIn,
     LogoutIn,
     RefreshIn,
-    RegisterIn,
     ResetPasswordIn,
     TokenOut,
 )
@@ -86,20 +84,15 @@ async def _ensure_permissions(session: AsyncSession, app: Application, keys: lis
     return out
 
 
-# Apps auto-provisioned alongside the one a new org actually signs up for —
-# they're companion products on the same platform (see UNDERSTANDING_THE_APP.md),
-# so a fresh org gets Owner access to all of them from one sign-up instead of
-# needing a separate registration per app (which isn't possible anyway, since
-# a second /register call for the same email would 409).
-AUTO_SUBSCRIBE_APPS: dict[str, list[str]] = {
-    "mail-agent": ["voice-agent"],
-}
-
-
 async def _provision_owner_membership(
     session: AsyncSession, *, user: User, org: Organization, app_key: str
 ) -> tuple[Application, Membership]:
-    """Find-or-create `app_key` and grant `user` an Owner membership in `org` for it."""
+    """Find-or-create `app_key` and grant `user` an Owner membership in `org` for it.
+
+    No longer called from this router — self-serve registration (`/auth/register`)
+    was removed when the product moved to a single, seeded organization (see
+    scripts/seed_org.py, the only remaining caller, which reuses this to provision
+    the seeded admin's Owner access to both apps)."""
     app = await session.scalar(select(Application).where(Application.key == app_key))
     if app is None:
         app = Application(key=app_key, name=app_key)
@@ -116,35 +109,6 @@ async def _provision_owner_membership(
     session.add(membership)
     await session.flush()
     return app, membership
-
-
-@router.post("/register", response_model=TokenOut, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterIn, session: AsyncSession = Depends(get_session)):
-    if not settings.bootstrap_enabled:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "self-serve signup is disabled")
-    if await session.scalar(select(User).where(User.email == body.email)):
-        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
-
-    user = User(email=body.email, password_hash=hash_password(body.password), full_name=body.full_name)
-    org = Organization(name=body.org_name, slug=_slug(body.org_name))
-    session.add_all([user, org])
-    await session.flush()
-
-    app, membership = await _provision_owner_membership(session, user=user, org=org, app_key=body.app_key)
-
-    for companion_key in AUTO_SUBSCRIBE_APPS.get(body.app_key, []):
-        if companion_key == body.app_key:
-            continue
-        await _provision_owner_membership(session, user=user, org=org, app_key=companion_key)
-
-    # Billing scopes one Subscription per org under "mail-agent" regardless of which
-    # app_key was used to register — a single plan covers both channels equally (see
-    # LANDING_PAGE_AND_PAYMENTS_PLAN.md §4). Best-effort: billing being unreachable
-    # must not block registration.
-    await start_trial(org_id=org.id, app_key="mail-agent")
-
-    roles, scope = _token_fields(app.key, membership)
-    return await _issue_tokens(session, user=user, org_id=org.id, app=app, roles=roles, scope=scope)
 
 
 @router.post("/login", response_model=TokenOut)

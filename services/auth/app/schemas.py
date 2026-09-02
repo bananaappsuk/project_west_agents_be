@@ -4,14 +4,6 @@ from pydantic import BaseModel, EmailStr, Field
 
 
 # ---- auth ----
-class RegisterIn(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8)
-    full_name: str | None = None
-    org_name: str = Field(min_length=1)   # self-serve signup creates a new org + owner
-    app_key: str = Field(min_length=1)     # which application the org signs up for
-
-
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
@@ -78,14 +70,3 @@ class MemberIn(BaseModel):
     org_id: str
     app_key: str
     role_names: list[str] = []
-
-
-class ProvisionIn(BaseModel):
-    """Create a new org + owner for an application in one call (the "sell one app" flow)."""
-
-    email: EmailStr
-    password: str | None = None   # required if the user does not yet exist
-    full_name: str | None = None
-    org_name: str
-    app_key: str
-    permission_keys: list[str] = []  # defaults to a sensible owner set if empty

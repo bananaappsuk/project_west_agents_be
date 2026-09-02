@@ -1,9 +1,9 @@
 """One-off backfill: grant the companion app to every existing (user, org) that
 only ever had one of {mail-agent, voice-agent}.
 
-New signups already get both automatically (see AUTO_SUBSCRIBE_APPS in
-routers/auth.py) — this catches accounts created before that existed, or
-accounts that were invited into only one app.
+scripts/seed_org.py grants the seeded admin both apps up front — this catches
+everyone else: accounts created before that existed, or accounts invited into
+only one app via the "Users & Roles" invite flow.
 
 For each (user, org) with a membership in app A but none in app B, this
 mirrors their exact role (Owner/Admin/User) into app B, reusing the same
