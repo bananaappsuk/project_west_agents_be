@@ -15,7 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, bt_client, crypto, s3_client
+from . import agent_client, billing_client, bt_client, crypto, s3_client
 from .db import SessionLocal
 from .models import AgentRun, Notification, Recording, VoiceSettings
 
@@ -37,6 +37,22 @@ _STUCK_PENDING_AFTER = timedelta(minutes=10)
 
 def is_running(org_id: str) -> bool:
     return org_id in _running
+
+
+def _duration_minutes(duration: str | None) -> float:
+    """Parses a stored "M:SS" (or "H:MM:SS") display string to minutes, for
+    billing's voice.minutes.month meter. Best-effort: an unparseable/blank
+    duration contributes 0 rather than raising."""
+    if not duration:
+        return 0.0
+    try:
+        parts = [int(p) for p in duration.split(":")]
+    except ValueError:
+        return 0.0
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds / 60
 
 
 async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:
@@ -76,6 +92,11 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
 
 
 async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
+    # Mirrors mail_agent's _run: checked here (not just in api.py's fetch_recordings)
+    # so a background-queued run started before an org's subscription lapsed still
+    # gets blocked once it actually executes, not just at the moment it was queued.
+    await billing_client.check_entitlement(org_id)
+
     # 1) short txn: read the org's connection settings for whichever source is active
     async with SessionLocal() as s:
         cfg = await s.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org_id))
@@ -112,10 +133,25 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
     # archive the existing "new" bucket with nothing to show for it.
     new: list[tuple[str, dict]] = []
     async with SessionLocal() as s:
-        fresh = [
-            m for m in recordings
-            if not await s.scalar(select(Recording).where(Recording.org_id == org_id, Recording.ext_id == m["ext_id"]))
-        ]
+        # One batched query instead of a per-recording SELECT, and an in-memory
+        # `seen` set to also catch two recordings sharing an ext_id *within this
+        # same fetch* (e.g. a source returning an overlapping page) — the old
+        # per-item DB check only looked at what was already stored, so an
+        # intra-batch duplicate passed the check for both, and the second
+        # `s.add(row)` / `s.flush()` below raised an uncaught IntegrityError that
+        # rolled back every already-flushed recording in this transaction.
+        fetched_ext_ids = [m["ext_id"] for m in recordings]
+        known_ext_ids = set(await s.scalars(
+            select(Recording.ext_id).where(Recording.org_id == org_id, Recording.ext_id.in_(fetched_ext_ids))
+        )) if fetched_ext_ids else set()
+        seen_ext_ids: set[str] = set()
+        fresh = []
+        for m in recordings:
+            eid = m["ext_id"]
+            if eid in known_ext_ids or eid in seen_ext_ids:
+                continue
+            seen_ext_ids.add(eid)
+            fresh.append(m)
 
         if sweep and fresh:
             # A bulk UPDATE, not a SELECT-then-mutate — the earlier ORM-load form
@@ -127,7 +163,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 .where(Recording.org_id == org_id, Recording.status == "new")
                 .values(status="old")
             )
-            if result.rowcount:
+            if result.rowcount and result.rowcount > 0:
                 log.info("sweep: moved %d recording(s) new -> old", result.rowcount)
 
         for m in fresh:
@@ -166,6 +202,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
 
     # 4) analyse via Agent Factory — NO DB connection held
     sem = asyncio.Semaphore(5)
+    payload_by_id = dict(new)
 
     async def analyze(rec_id: str, payload: dict):
         async with sem:
@@ -208,5 +245,9 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
             source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
             s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
         await s.commit()
+
+    total_minutes = sum(_duration_minutes(payload_by_id[rid].get("duration")) for rid, _, ok in results if ok)
+    await billing_client.record_usage(org_id, total_minutes)
+
     log.info("run recorded: org=%s fetched=%d processed=%d high_risk=%d", org_id, len(recordings), len(new), high)
     return [rid for rid, _ in new]
