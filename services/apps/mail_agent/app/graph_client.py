@@ -8,6 +8,7 @@ read provider covers both directions — there is no separate SMTP step.
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 from typing import NamedTuple
 
@@ -36,6 +37,30 @@ def _get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     if "access_token" not in result:
         raise RuntimeError(f"{result.get('error')}: {result.get('error_description')}")
     return result["access_token"]
+
+
+def _fetch_attachments(token: str, mailbox: str, message_id: str) -> list[dict]:
+    """Forwarded to the CRM alongside a referral/communication (crm_sync.py) — never
+    persisted to our own DB, same "don't store the binary" precedent as call audio."""
+    try:
+        resp = requests.get(
+            f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for a in resp.json().get("value", []):
+        if a.get("@odata.type") != "#microsoft.graph.fileAttachment" or not a.get("contentBytes"):
+            continue
+        out.append({
+            "filename": a.get("name") or "attachment",
+            "content_type": a.get("contentType") or "application/octet-stream",
+            "data": base64.b64decode(a["contentBytes"]),
+        })
+    return out
 
 
 # Hard ceiling on how many messages a single fetch will page through, even when
@@ -80,7 +105,7 @@ def fetch_latest(
     params: dict | None = {
         "$top": page_size,
         "$orderby": "receivedDateTime asc",
-        "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
+        "$select": "id,subject,from,receivedDateTime,bodyPreview,body,hasAttachments",
     }
     if since_at:
         iso = since_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -111,6 +136,7 @@ def fetch_latest(
                 "body": body_field.get("content") or m.get("bodyPreview", ""),
                 "contentType": content_type,
                 "receivedAt": received_at,
+                "attachments": _fetch_attachments(token, mailbox, m["id"]) if m.get("hasAttachments") else [],
             })
             if count and len(out) >= count:
                 break

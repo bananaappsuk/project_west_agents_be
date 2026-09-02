@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 
-from . import agent_client, bt_client, crypto, s3_client
+from . import agent_client, bt_client, crm_sync, crypto, s3_client
 from .db import SessionLocal
 from .models import AgentRun, Notification, Recording, VoiceSettings
 
@@ -192,6 +192,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 r.analysis_status = "done"
                 if r.risk == "High":
                     high += 1
+                r.crm_status, r.crm_reference = await crm_sync.after_call_analysis(r, a)
             else:
                 r.analysis_status = "failed"
         all_ok = all(ok for _, _, ok in results)

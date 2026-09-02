@@ -25,7 +25,7 @@ import nh3
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 
-from . import agent_client, billing_client, crypto, graph_client, mail_client
+from . import agent_client, billing_client, crm_sync, crypto, graph_client, mail_client
 from .db import SessionLocal
 from .models import AgentConfig, AgentRun, Email, Mailbox
 from .schemas import serialize_email
@@ -142,11 +142,18 @@ async def _count_skipped(org_id: str) -> int:
 
 async def analyze_and_persist(
     org_id: str, rows: list[tuple[str, dict]], *, auto_reply_enabled: bool, send_creds: dict, provider: str,
-    sem: asyncio.Semaphore | None = None,
+    sem: asyncio.Semaphore | None = None, attachments_by_id: dict[str, list[dict]] | None = None,
 ) -> tuple[int, int, bool]:
     """Analyzes + persists a batch of (email_id, payload) pairs — the shared
     core used by a sync's post-fetch auto-analysis, a manual backlog catch-up,
-    and the per-email retry button. Returns (analyzed_ok_count, high_priority_count, all_ok)."""
+    and the per-email retry button. Returns (analyzed_ok_count, high_priority_count, all_ok).
+
+    `attachments_by_id`, when given, forwards each email's attachment bytes (never
+    persisted to the row — see mail_client/graph_client) to the CRM alongside any
+    referral/case-communication/reschedule detected in it. Only the initial sync's
+    caller has these on hand — a backlog catch-up or a later retry has no way to
+    recover attachment bytes for an already-stored row, so those calls omit it and
+    a detected intent still files to the CRM, just without attachments."""
     if not rows:
         return 0, 0, True
     sem = sem or asyncio.Semaphore(_ANALYZE_CONCURRENCY)
@@ -205,6 +212,9 @@ async def analyze_and_persist(
                 e.summary_status = "done"
                 if e.priority == "High":
                     high += 1
+                e.crm_status, e.crm_reference = await crm_sync.after_email_analysis(
+                    e, a, (attachments_by_id or {}).get(email_id)
+                )
 
                 suggested_reply = a.get("suggested_reply", "") or ""
                 if not e.needs_reply:
@@ -365,6 +375,10 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
     total_fetched = total_processed = total_archived = 0
     swept = False
     batch_num = 0
+    # Attachment bytes never persist to a row (see mail_client/graph_client) — held
+    # here only long enough to reach analyze_and_persist's CRM-forwarding step below,
+    # keyed by the email id assigned at insert time.
+    attachments_by_id: dict[str, list[dict]] = {}
 
     # --- import phase: fetch + dedup + insert(skipped) + sweep + advance watermark ---
     while True:
@@ -417,6 +431,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                 s.add(row)
                 await s.flush()
                 new.append(row.id)
+                attachments_by_id[row.id] = m.get("attachments") or []
 
             # Advance the watermark to what this batch *examined* (not just what
             # ended up fresh) — a transient single-message fetch failure or an
@@ -459,6 +474,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
     rows = await _select_for_analysis(org_id, _AUTO_ANALYZE_COUNT)
     _, high, all_ok = await analyze_and_persist(
         org_id, rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider, sem=sem,
+        attachments_by_id=attachments_by_id,
     )
 
     async with SessionLocal() as s:

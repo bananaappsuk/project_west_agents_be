@@ -53,6 +53,9 @@ class Recording(Base):
     ai_reply: Mapped[str] = mapped_column(Text, default="")
     reply_status: Mapped[str] = mapped_column(String, default="none")   # none|pending|edited|approved|sent|rejected
     analysis_status: Mapped[str] = mapped_column(String, default="pending")  # pending|done|failed
+    # CRM intake (pw-crm-be) outcome for this call's detected intent, if any.
+    crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
+    crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref
     # new = latest cron extraction; old = swept by a later run
     status: Mapped[str] = mapped_column(String, default="new", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

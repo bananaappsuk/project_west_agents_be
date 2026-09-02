@@ -53,6 +53,28 @@ def _extract_body(msg: email.message.Message) -> tuple[str, str]:
     return msg.get_payload() or "", content_type
 
 
+def _extract_attachments(msg: email.message.Message) -> list[dict]:
+    """Forwarded to the CRM alongside a referral/communication (crm_sync.py) — never
+    persisted to our own DB, same "don't store the binary" precedent as call audio."""
+    if not msg.is_multipart():
+        return []
+    out: list[dict] = []
+    for part in msg.walk():
+        disp = str(part.get("Content-Disposition") or "")
+        filename = part.get_filename()
+        if not filename or ("attachment" not in disp and "inline" not in disp):
+            continue
+        data = part.get_payload(decode=True)
+        if not data:
+            continue
+        out.append({
+            "filename": _decode(filename),
+            "content_type": part.get_content_type() or "application/octet-stream",
+            "data": data,
+        })
+    return out
+
+
 def fetch_latest(
     *, imap_host: str, imap_port: int, username: str, password: str, count: int,
     known_uids: set[str] | None = None, since_uid: str | None = None,
@@ -113,6 +135,7 @@ def fetch_latest(
                 "body": body,
                 "contentType": content_type,
                 "receivedAt": received,
+                "attachments": _extract_attachments(msg),
             })
         return FetchResult(out, max_uid_seen)
     finally:

@@ -19,5 +19,12 @@ class Settings(BaseServiceSettings):
     cron_tick_minutes: int = 5    # how often the scheduler checks each org's schedule
     fetch_per_run: int = 20
 
+    # CRM intake (pw-crm-be) — referrals, case communications, session change requests.
+    # Off by default so environments without real CRM credentials never call out.
+    crm_enabled: bool = False
+    crm_base_url: str = "http://localhost:8000/api/v1"
+    crm_client_id: str = ""
+    crm_api_key: str = ""
+
 
 settings = Settings()

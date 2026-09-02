@@ -199,7 +199,7 @@ async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), s
     action, for a "skipped" (never analyzed — see pipeline.py) or "failed" row
     alike. Goes through the same shared analyze_and_persist pipeline.py uses
     everywhere else, so this gets the full result (confidence, needs_reply,
-    auto-reply draft, ...), not just summary/category/priority."""
+    auto-reply draft, CRM sync, ...), not just summary/category/priority."""
     org = _org(claims)
     e = await _get_email(session, org, email_id)
     e.summary_status = "pending"

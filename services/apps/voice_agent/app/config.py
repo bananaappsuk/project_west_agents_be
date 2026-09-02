@@ -25,5 +25,12 @@ class Settings(BaseServiceSettings):
     openai_api_key: str | None = None
     transcribe_model: str = "whisper-1"
 
+    # CRM intake (pw-crm-be) — referrals, case communications, session change requests.
+    # Off by default so environments without real CRM credentials never call out.
+    crm_enabled: bool = False
+    crm_base_url: str = "http://localhost:8000/api/v1"
+    crm_client_id: str = ""
+    crm_api_key: str = ""
+
 
 settings = Settings()
