@@ -28,10 +28,11 @@ class Settings(BaseServiceSettings):
     # "[Errno 101] Network is unreachable"), so raw SMTP can never succeed there
     # regardless of credentials. SendGrid is plain HTTPS, unaffected. Leave unset
     # to keep using raw SMTP (e.g. for local dev, where it does work).
-    # sendgrid_from_email must be a Single Sender verified in the SendGrid
-    # dashboard — SendGrid rejects sends from an unverified address.
+    #
+    # No separate "from" setting here — sendgrid_client sends as whichever
+    # mailbox's own address is currently configured (same as raw SMTP always
+    # did), which must be a Single Sender verified in the SendGrid dashboard.
     sendgrid_api_key: str | None = None
-    sendgrid_from_email: str | None = None
 
 
 settings = Settings()

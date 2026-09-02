@@ -17,14 +17,23 @@ from .config import settings
 SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
 
 
-def send_reply(*, to_addr: str, subject: str, body: str, **_ignored_send_creds) -> None:
-    """`_ignored_send_creds` absorbs whatever the caller's `send_creds` dict for
-    this org happens to carry (smtp_host/smtp_port/username/password for an
-    IMAP mailbox) — this function needs none of that, it authenticates with
-    `settings.sendgrid_api_key` instead, so callers don't need special-casing
-    to swap send functions."""
-    if not settings.sendgrid_api_key or not settings.sendgrid_from_email:
-        raise RuntimeError("SENDGRID_API_KEY / SENDGRID_FROM_EMAIL not configured")
+def send_reply(*, username: str, to_addr: str, subject: str, body: str, **_ignored_send_creds) -> None:
+    """`username` is the configured mailbox's own address (the same value the
+    IMAP read client logs in with) — replies send "from" this, same as raw SMTP
+    always did, so switching the configured mailbox to a different address
+    keeps sending as that address rather than some fixed, unrelated sender.
+
+    SendGrid requires `username` to be a Single Sender verified in its
+    dashboard, or it rejects the send with 403 — so reconfiguring the mailbox
+    to a new address also means verifying that new address in SendGrid, or
+    auto-send starts failing (safely — falls back to a draft, same as any
+    other send failure) until it's verified.
+
+    `_ignored_send_creds` absorbs smtp_host/smtp_port/password, which this
+    doesn't need — `send_creds` is shared with the raw-SMTP send path, and
+    callers pass it through unchanged regardless of which one ends up used."""
+    if not settings.sendgrid_api_key:
+        raise RuntimeError("SENDGRID_API_KEY not configured")
     resp = requests.post(
         SENDGRID_API_URL,
         headers={
@@ -33,7 +42,7 @@ def send_reply(*, to_addr: str, subject: str, body: str, **_ignored_send_creds) 
         },
         json={
             "personalizations": [{"to": [{"email": to_addr}]}],
-            "from": {"email": settings.sendgrid_from_email},
+            "from": {"email": username},
             "subject": subject,
             "content": [{"type": "text/plain", "value": body}],
         },
