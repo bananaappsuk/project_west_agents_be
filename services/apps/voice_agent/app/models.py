@@ -61,6 +61,10 @@ class Recording(Base):
     # CRM intake (pw-crm-be) outcome for this call's detected intent, if any.
     crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
     crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref
+    # POST /intake/activity's own reference (e.g. "PW-A-2026-0009") — a separate
+    # cross-referencing log entry sent for every call regardless of crm_status,
+    # not to be confused with crm_reference (the referral/case outcome, if any).
+    activity_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     # new = latest cron extraction; old = swept by a later run
     status: Mapped[str] = mapped_column(String, default="new", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

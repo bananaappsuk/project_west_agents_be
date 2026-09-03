@@ -2,8 +2,15 @@
 
 Called from pipeline.py right after an email's analysis succeeds, and from
 api.retry_summary when a previously-failed/skipped row is retried. Never raises —
-a CRM problem only ever costs this one row's crm_status, exactly like a failed
-Agent Factory call only costs summary_status (see pipeline.py's crash-safety notes).
+a CRM problem only ever costs this one row's crm_status/activity_ref, exactly like
+a failed Agent Factory call only costs summary_status (see pipeline.py's
+crash-safety notes).
+
+POST /intake/activity is called once per email, always — see
+CRM_ACTIVITY_LOG_PROPOSAL.md for the agreed contract. It's not a replacement for
+submit_referral/submit_communication; it's the cross-referencing record that a
+contact was handled at all, pointing at whichever of those also ran (or noting
+that neither did, and why).
 """
 
 from __future__ import annotations
@@ -49,30 +56,66 @@ async def _upload_attachments(attachments: list[dict]) -> list[dict]:
     return out
 
 
+async def _log_activity(*, occurred_at: str, summary: str, outcome: str,
+                         outcome_reference: str | None, case_ref: str | None,
+                         sender: str, from_email: str, uid: str) -> str | None:
+    """POST /intake/activity — best-effort, never raises. Returns activity_ref or None.
+    Called once per email regardless of outcome (see module docstring)."""
+    payload = {
+        "agent": "EMAIL_AGENT",
+        "contact_channel": "EMAIL",
+        "occurred_at": occurred_at,
+        "summary": summary or "(no summary)",
+        "outcome": outcome,
+        "outcome_reference": outcome_reference,
+        "case_ref": case_ref,
+        # Real sender name/address only — never a phone-shaped placeholder from a
+        # different channel (the CRM team flagged exactly this mistake while
+        # testing their own example payloads; this is the email side, no phone).
+        "participant_name": sender or None,
+        "participant_email": from_email or None,
+        "external_ref": uid,
+    }
+    try:
+        res = await crm_client.submit_activity(payload)
+        return res.get("activity_ref")
+    except Exception as exc:
+        log.warning("activity log FAILED: email uid=%s outcome=%s: %s", uid, outcome, exc)
+        return None
+
+
 async def after_email_analysis(
     email_payload: dict, analysis: dict, attachments: list[dict] | None = None
-) -> tuple[str, str | None]:
-    """Returns (crm_status, crm_reference). crm_status is "none" | "sent" | "skipped" | "failed".
+) -> tuple[str, str | None, str | None]:
+    """Returns (crm_status, crm_reference, activity_ref). crm_status is
+    "none" | "sent" | "skipped" | "failed" — the referral/communication outcome.
+    activity_ref is the separate POST /intake/activity reference, set whenever
+    CRM sync is enabled at all (independent of crm_status).
 
     Takes the same serialized dict (schemas.serialize_email) pipeline.py already
     carries around for the LLM call, rather than the live `Email` ORM row —
     deliberately: this function makes slow HTTP calls (attachment upload,
-    referral/communication submission), and taking a plain dict instead of an
-    attached ORM object means the caller can run it fully outside any open DB
-    transaction/session (see pipeline.py's analyze_and_persist), never holding a
-    pooled connection for however long the CRM API takes to respond."""
+    referral/communication/activity submission), and taking a plain dict instead
+    of an attached ORM object means the caller can run it fully outside any open
+    DB transaction/session (see pipeline.py's analyze_and_persist), never holding
+    a pooled connection for however long the CRM API takes to respond."""
     if not settings.crm_enabled:
-        return "none", None
+        return "none", None, None
 
     intent = analysis.get("intent") or "NONE"
-    if intent == "NONE":
-        return "none", None
-
     uid = email_payload.get("uid")
     subject = email_payload.get("subject")
     sender = email_payload.get("from")
     from_email = email_payload.get("fromEmail")
     received_at = email_payload.get("receivedAt")  # already an ISO string, or None
+    summary = analysis.get("summary") or ""
+
+    occurred_at = received_at or datetime.now(timezone.utc).isoformat()
+
+    outcome = "NO_ACTION"
+    outcome_reference: str | None = None
+    case_ref: str | None = None
+    crm_status, crm_reference = "none", None
 
     uploaded = await _upload_attachments(attachments or [])
 
@@ -96,42 +139,65 @@ async def after_email_analysis(
                 "attachments": uploaded,
             }
             res = await crm_client.submit_referral(payload)
-            return "sent", res.get("reference")
+            crm_reference = res.get("submission_ref")
+            crm_status = "sent"
+            outcome, outcome_reference = "REFERRAL_CREATED", crm_reference
 
-        if intent in _COMMUNICATION_INTENTS:
-            case_ref = analysis.get("case_ref") or ""
+        elif intent in _COMMUNICATION_INTENTS:
+            case_ref = analysis.get("case_ref") or None
             if not case_ref:
                 log.info("communication skipped, no case_ref found: email uid=%s", uid)
-                return "skipped", None
-            if intent in ("RESCHEDULE", "CANCEL") and not (analysis.get("meeting_reference") or ""):
-                log.info("change request skipped, no meeting_reference found: email uid=%s", uid)
-                return "skipped", None
+                crm_status = "skipped"
+                outcome = "SKIPPED_NO_CASE"
+            else:
+                is_change = intent in ("RESCHEDULE", "CANCEL") and bool(analysis.get("meeting_reference"))
+                payload = {
+                    "case_ref": case_ref,
+                    "channel": "EMAIL",
+                    "direction": "INBOUND",
+                    "category": "CHANGE_OR_CANCEL_SESSION" if is_change else "EXISTING_CASE",
+                    "occurred_at": occurred_at,
+                    "subject": subject,
+                    "summary": summary or subject or "",
+                    "participant_name": sender,
+                    "participant_address": from_email,
+                    "attachments": uploaded,
+                    "external_ref": uid,
+                    "source_payload": {"thread_id": uid},
+                }
+                if is_change:
+                    payload["meeting_reference"] = analysis["meeting_reference"]
+                    payload["request_type"] = intent
+                    if intent == "RESCHEDULE" and analysis.get("preferred_start_at"):
+                        payload["preferred_start_at"] = analysis["preferred_start_at"]
+                elif intent in ("RESCHEDULE", "CANCEL"):
+                    # Case is known but the AI couldn't pin down which meeting —
+                    # log it as a plain communication against the case rather than
+                    # dropping it outright; a coordinator still needs to see it.
+                    log.info(
+                        "change request downgraded to plain communication, no meeting_reference: email uid=%s",
+                        uid,
+                    )
 
-            payload = {
-                "case_ref": case_ref,
-                "channel": "EMAIL",
-                "direction": "INBOUND",
-                "category": "CANCELLATION" if intent in ("RESCHEDULE", "CANCEL") else "GENERAL",
-                # occurred_at is required by the CRM's schema — fall back to "now" for the
-                # rare message with no parseable Date header rather than send a null.
-                "occurred_at": received_at or datetime.now(timezone.utc).isoformat(),
-                "subject": subject,
-                "summary": analysis.get("summary") or subject or "",
-                "participant_name": sender,
-                "participant_address": from_email,
-                "attachments": uploaded,
-                "external_ref": uid,
-                "source_payload": {"thread_id": uid},
-            }
-            if intent in ("RESCHEDULE", "CANCEL"):
-                payload["meeting_reference"] = analysis["meeting_reference"]
-                payload["request_type"] = intent
-                if intent == "RESCHEDULE" and analysis.get("preferred_start_at"):
-                    payload["preferred_start_at"] = analysis["preferred_start_at"]
-            res = await crm_client.submit_communication(payload)
-            return "sent", case_ref
-
-        return "none", None
+                res = await crm_client.submit_communication(payload)
+                crm_status, crm_reference = "sent", case_ref
+                if is_change:
+                    outcome = "CHANGE_REQUEST_RAISED"
+                    outcome_reference = res.get("change_request_id") or case_ref
+                else:
+                    outcome, outcome_reference = "COMMUNICATION_LOGGED", case_ref
     except Exception as exc:
         log.warning("CRM submission failed: email uid=%s intent=%s: %s", uid, intent, exc)
-        return "failed", None
+        crm_status = "failed"
+        # Per CRM_ACTIVITY_LOG_PROPOSAL.md §6.4: the CRM's outcome enum has no
+        # FAILED value, and we agreed not to report failures through to them at
+        # all (crm_status="failed" is visible on our own side only) — so this
+        # still logs an activity row, just as NO_ACTION, not a made-up value.
+        outcome, outcome_reference, case_ref = "NO_ACTION", None, None
+
+    activity_ref = await _log_activity(
+        occurred_at=occurred_at, summary=summary, outcome=outcome,
+        outcome_reference=outcome_reference, case_ref=case_ref,
+        sender=sender, from_email=from_email, uid=uid,
+    )
+    return crm_status, crm_reference, activity_ref

@@ -233,15 +233,15 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
     # seconds; running it here rather than inside the persist transaction below
     # means a slow or failing CRM call can never hold a pooled connection open
     # or roll back rows that already finished processing.
-    async def do_crm(rec_id: str, a: dict, ok: bool) -> tuple[str, str, str | None]:
+    async def do_crm(rec_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
         if not ok:
-            return rec_id, "none", None
+            return rec_id, "none", None, None
         async with sem:
-            status, ref = await crm_sync.after_call_analysis(payload_by_id[rec_id], a)
-            return rec_id, status, ref
+            status, ref, activity_ref = await crm_sync.after_call_analysis(payload_by_id[rec_id], a)
+            return rec_id, status, ref, activity_ref
 
     crm_results = await asyncio.gather(*(do_crm(rid, a, ok) for rid, a, ok in results))
-    crm_by_id = {rid: (status, ref) for rid, status, ref in crm_results}
+    crm_by_id = {rid: (status, ref, activity_ref) for rid, status, ref, activity_ref in crm_results}
 
     # 5) short txn: persist analysis + record the run + notification
     high = 0
@@ -262,7 +262,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 r.analysis_status = "done"
                 if r.risk == "High":
                     high += 1
-                r.crm_status, r.crm_reference = crm_by_id.get(rec_id, ("none", None))
+                r.crm_status, r.crm_reference, r.activity_ref = crm_by_id.get(rec_id, ("none", None, None))
             else:
                 r.analysis_status = "failed"
         all_ok = all(ok for _, _, ok in results)

@@ -60,6 +60,10 @@ class Email(Base):
     intent: Mapped[str] = mapped_column(String, default="NONE")  # REFERRAL|CASE_COMMUNICATION|RESCHEDULE|CANCEL|NONE
     crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
     crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref
+    # POST /intake/activity's own reference (e.g. "PW-A-2026-0009") — a separate
+    # cross-referencing log entry sent for every email regardless of crm_status,
+    # not to be confused with crm_reference (the referral/case outcome, if any).
+    activity_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     # buckets / lifecycle
     folder_id: Mapped[str | None] = mapped_column(String, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

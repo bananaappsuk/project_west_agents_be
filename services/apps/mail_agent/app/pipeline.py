@@ -220,17 +220,17 @@ async def analyze_and_persist(
     # rather than inside the persist transaction below means a slow or failing
     # CRM call can never hold a pooled connection open or roll back rows that
     # already finished processing.
-    async def do_crm(email_id: str, a: dict, ok: bool) -> tuple[str, str, str | None]:
+    async def do_crm(email_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
         if not ok:
-            return email_id, "none", None
+            return email_id, "none", None, None
         async with sem:
-            status, ref = await crm_sync.after_email_analysis(
+            status, ref, activity_ref = await crm_sync.after_email_analysis(
                 payload_by_id[email_id], a, (attachments_by_id or {}).get(email_id)
             )
-            return email_id, status, ref
+            return email_id, status, ref, activity_ref
 
     crm_results = await asyncio.gather(*(do_crm(eid, a, ok) for eid, a, ok, _sent in sent_results))
-    crm_by_id = {eid: (status, ref) for eid, status, ref in crm_results}
+    crm_by_id = {eid: (status, ref, activity_ref) for eid, status, ref, activity_ref in crm_results}
 
     high = 0
     async with SessionLocal() as s:
@@ -248,7 +248,7 @@ async def analyze_and_persist(
                 if e.priority == "High":
                     high += 1
                 e.intent = a.get("intent") or "NONE"
-                e.crm_status, e.crm_reference = crm_by_id.get(email_id, ("none", None))
+                e.crm_status, e.crm_reference, e.activity_ref = crm_by_id.get(email_id, ("none", None, None))
 
                 suggested_reply = a.get("suggested_reply", "") or ""
                 if not e.needs_reply:
