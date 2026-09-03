@@ -12,7 +12,7 @@ REST API:
   4. Text  — recordings are AUDIO ONLY, so we transcribe with the OpenAI transcription
              API (VOICE OPENAI_API_KEY) before the Agent Factory analyses the transcript.
 
-If no JWT credential is configured for the org, `fetch_latest` returns realistic **demo**
+If no JWT credential is configured for the org, `list_latest` returns realistic **demo**
 recordings so the whole pipeline runs without a BT account (mirrors the Agent Factory's
 "runs without a paid key" philosophy). Configure the JWT in Settings to go live.
 
@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import logging
 import random
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -36,6 +37,26 @@ import httpx
 from .transcribe import transcribe
 
 log = logging.getLogger("voice_agent.bt_client")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Access-token cache — this deployment has one BT Cloud Work account (no multi-
+# org feature), so a single cached RingCentral OAuth token is reused across a
+# sync's listing call, every transcription in that sync, and any later
+# on-demand audio playback request, instead of minting a fresh token per call.
+# Safe as a module-level variable: this service runs single-process (no
+# --workers, see run-all.ps1).
+# ─────────────────────────────────────────────────────────────────────────────
+_token_cache: tuple[str, float] | None = None  # (access_token, expires_at_epoch)
+_TOKEN_EXPIRY_BUFFER = 60.0  # seconds of headroom before a cached token is treated as expired
+
+
+def _get_token(server: str, client_id: str, client_secret: str, jwt: str, *, force: bool = False) -> str:
+    global _token_cache
+    if not force and _token_cache and _token_cache[1] - _TOKEN_EXPIRY_BUFFER > time.time():
+        return _token_cache[0]
+    token, expires_in = _access_token(server, client_id, client_secret, jwt)
+    _token_cache = (token, time.time() + expires_in)
+    return token
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Demo data (used until a JWT credential is configured)
@@ -99,7 +120,7 @@ def _server(endpoint: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def _access_token(server: str, client_id: str, client_secret: str, jwt: str) -> str:
+def _access_token(server: str, client_id: str, client_secret: str, jwt: str) -> tuple[str, int]:
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     with httpx.Client(timeout=30.0) as c:
         r = c.post(
@@ -108,7 +129,8 @@ def _access_token(server: str, client_id: str, client_secret: str, jwt: str) -> 
             data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jwt},
         )
         r.raise_for_status()
-        return r.json()["access_token"]
+        body = r.json()
+        return body["access_token"], int(body.get("expires_in", 3600))
 
 
 def _list_call_recordings(server: str, token: str, count: int) -> list[dict]:
@@ -130,7 +152,23 @@ def _download_recording(token: str, content_uri: str) -> tuple[bytes, str]:
         return r.content, r.headers.get("content-type", "audio/mpeg")
 
 
-def _to_raw(rec: dict, token: str) -> dict:
+def _with_token_retry(server: str, client_id: str, client_secret: str, jwt: str, fn):
+    """Run `fn(token)`, retrying once with a freshly-minted token if the cached one turns
+    out to be stale (401) — handles a token that expired mid-cache-life or a JWT that was
+    rotated since it was cached."""
+    token = _get_token(server, client_id, client_secret, jwt)
+    try:
+        return fn(token)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 401:
+            raise
+        token = _get_token(server, client_id, client_secret, jwt, force=True)
+        return fn(token)
+
+
+def _to_meta(rec: dict) -> dict:
+    """Call-log metadata only — no audio download, no transcription. The listing response
+    already includes `recording.contentUri`, so this is effectively free."""
     direction = rec.get("direction")  # "Inbound" | "Outbound"
     frm = rec.get("from") or {}
     to = rec.get("to") or {}
@@ -146,15 +184,6 @@ def _to_raw(rec: dict, token: str) -> dict:
     duration = f"{secs // 60}:{secs % 60:02d}"
 
     recording = rec.get("recording") or {}
-    transcript = ""
-    content_uri = recording.get("contentUri")
-    if content_uri:
-        try:
-            audio, ctype = _download_recording(token, content_uri)
-            transcript = transcribe(audio, ctype)
-        except Exception as exc:
-            log.warning("download/transcribe failed for call %s: %s", rec.get("id"), exc)
-
     return {
         "ext_id": str(rec.get("id") or recording.get("id") or uuid.uuid4().hex),
         "caller": caller,
@@ -162,29 +191,65 @@ def _to_raw(rec: dict, token: str) -> dict:
         "agent": agent,
         "date": call_date,
         "duration": duration,
-        "transcript": transcript or "(no transcript available)",
+        "content_uri": recording.get("contentUri"),
     }
 
 
-def _fetch_real(count: int, *, endpoint: str, client_id: str, client_secret: str, jwt: str) -> list[dict]:
+def _list_real(count: int, *, endpoint: str, client_id: str, client_secret: str, jwt: str) -> list[dict]:
     server = _server(endpoint)
-    token = _access_token(server, client_id, client_secret, jwt)
-    records = _list_call_recordings(server, token, count)
+    records = _with_token_retry(
+        server, client_id, client_secret, jwt,
+        lambda token: _list_call_recordings(server, token, count),
+    )
     log.info("bt_client: %d recording(s) from BT Cloud Work (live)", len(records))
-    return [_to_raw(rec, token) for rec in records]
+    return [_to_meta(rec) for rec in records]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_latest(count: int, *, endpoint: str, client_id: str, client_secret: str, jwt: str = "") -> list[dict]:
-    """Return up to `count` raw recordings (no AI fields). Live when a JWT is configured,
-    otherwise demo data. Live failures propagate so the caller can surface them."""
+def list_latest(count: int, *, endpoint: str, client_id: str, client_secret: str, jwt: str = "") -> list[dict]:
+    """Return up to `count` recordings' metadata (no transcript, no audio download). Live
+    when a JWT is configured, otherwise demo data (which already carries a canned
+    `transcript`, so callers should skip `transcribe_one` for any item that has one). Live
+    failures propagate so the caller can surface them."""
     if jwt:
-        return _fetch_real(count, endpoint=endpoint, client_id=client_id, client_secret=client_secret, jwt=jwt)
+        return _list_real(count, endpoint=endpoint, client_id=client_id, client_secret=client_secret, jwt=jwt)
     log.info("bt_client: fetching %d demo recording(s) (no JWT configured)", count)
     return _fetch_demo(count)
+
+
+def transcribe_one(item: dict, *, endpoint: str, client_id: str, client_secret: str, jwt: str) -> str:
+    """Download and transcribe a single recording — only called for items `list_latest`
+    didn't already provide a transcript for (i.e. never for already-known/demo items)."""
+    content_uri = item.get("content_uri")
+    if not content_uri:
+        return "(no transcript available)"
+    server = _server(endpoint)
+    try:
+        audio, ctype = _with_token_retry(
+            server, client_id, client_secret, jwt,
+            lambda token: _download_recording(token, content_uri),
+        )
+        return transcribe(audio, ctype) or "(no transcript available)"
+    except Exception as exc:
+        log.warning("download/transcribe failed for call %s: %s", item.get("ext_id"), exc)
+        return "(no transcript available)"
+
+
+def fetch_audio(*, endpoint: str, client_id: str, client_secret: str, jwt: str, content_uri: str) -> tuple[bytes, str]:
+    """Re-fetch one recording's raw audio bytes on demand for playback — nothing is stored
+    locally, mirrors s3_client.download's role for the S3 source (see api.py's
+    GET /recordings/{id}/audio). Raises on missing JWT / failed auth / download error; the
+    caller is responsible for turning that into an HTTP error."""
+    if not jwt:
+        raise ValueError("no JWT configured — cannot fetch live audio")
+    server = _server(endpoint)
+    return _with_token_retry(
+        server, client_id, client_secret, jwt,
+        lambda token: _download_recording(token, content_uri),
+    )
 
 
 def test_connection(*, endpoint: str, client_id: str, client_secret: str, jwt: str = "") -> str:
