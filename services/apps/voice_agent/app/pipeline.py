@@ -84,7 +84,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
             raise LookupError("no recording source configured for this org")
         source_type = cfg.source_type
         if source_type == "s3":
-            fetch_fn = s3_client.fetch_latest
+            list_fn, transcribe_fn = s3_client.list_latest, s3_client.transcribe_one
             creds = {
                 "endpoint": cfg.s3_endpoint,
                 "region": cfg.s3_region,
@@ -93,24 +93,30 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 "access_key_id": cfg.s3_access_key_id,
                 "secret_access_key": crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
             }
+            transcribe_creds = {k: v for k, v in creds.items() if k != "prefix"}
         else:
-            fetch_fn = bt_client.fetch_latest
+            list_fn, transcribe_fn = bt_client.list_latest, bt_client.transcribe_one
             creds = {
                 "endpoint": cfg.endpoint,
                 "client_id": cfg.client_id,
                 "client_secret": crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
                 "jwt": crypto.decrypt(cfg.jwt_enc) if cfg.jwt_enc else "",
             }
+            transcribe_creds = creds
 
-    # 2) fetch from the source — NO DB connection held
-    recordings = await run_in_threadpool(fetch_fn, count, **creds)
-    log.info("fetch: pulled %d recording(s) via %s", len(recordings), source_type)
+    # 2) list metadata from the source — NO DB connection held, NO audio download yet.
+    # Downloading + transcribing happens below, in step 3.5, and only for recordings this
+    # org doesn't already have — a call already synced before is never re-downloaded or
+    # re-transcribed just because it still shows up in a fresh listing.
+    recordings = await run_in_threadpool(list_fn, count, **creds)
+    log.info("fetch: listed %d recording(s) via %s", len(recordings), source_type)
 
-    # 3) short txn: dedup, then sweep prior 'new' -> 'old' only if this run actually
-    # has something to replace them with — an empty/all-duplicate fetch (source
-    # temporarily returned nothing, or a re-run within the same window) must never
-    # archive the existing "new" bucket with nothing to show for it.
-    new: list[tuple[str, dict]] = []
+    # 3) short, read-only txn: dedup (metadata only, no transcript yet). The sweep
+    # (archiving the prior "new" batch) deliberately does NOT happen here — it's
+    # deferred to step 4, in the same transaction as the insert, so that if this
+    # run's insert fails for any reason, the archive never took effect either. A
+    # run that ends up saving 0 recordings must never still have archived the
+    # previous batch on its way to failing.
     async with SessionLocal() as s:
         # One batched query instead of a per-recording SELECT, and an in-memory
         # `seen` set to also catch two recordings sharing an ext_id *within this
@@ -131,7 +137,32 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 continue
             seen_ext_ids.add(eid)
             fresh.append(m)
+    log.info("fetch: %d new recording(s) after dedup", len(fresh))
 
+    # 3.5) transcribe — NO DB connection held, and only for items dedup didn't already
+    # drop. This is the whole point of splitting list/transcribe: a call already synced
+    # in an earlier run is never downloaded or sent to Whisper again just because it's
+    # still within the source's listing window. Demo items already carry a canned
+    # transcript from list_latest, so they skip this entirely.
+    transcribe_sem = asyncio.Semaphore(5)
+
+    async def fill_transcript(m: dict) -> dict:
+        if m.get("transcript"):
+            return m
+        async with transcribe_sem:
+            m["transcript"] = await run_in_threadpool(transcribe_fn, m, **transcribe_creds)
+            return m
+
+    fresh = await asyncio.gather(*(fill_transcript(m) for m in fresh))
+
+    # 4) short txn: sweep prior 'new' -> 'old' (only if this run actually has
+    # something fresh to replace them with — see step 3's comment), THEN insert
+    # the newly-fetched (now-transcribed) recordings, in the SAME transaction —
+    # one commit covers both, so a failure anywhere in this block (e.g. an insert
+    # error) rolls the sweep back too, instead of archiving the previous batch
+    # on the way to saving zero new recordings.
+    new: list[tuple[str, dict]] = []
+    async with SessionLocal() as s:
         if sweep and fresh:
             # A bulk UPDATE, not a SELECT-then-mutate — the earlier ORM-load form
             # pulled every "new" recording's full transcript/summary/ai_reply text
@@ -149,7 +180,8 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
             row = Recording(
                 org_id=org_id, ext_id=m["ext_id"], source_type=source_type, caller=m["caller"], phone=m["phone"],
                 agent=m["agent"], call_date=m["date"], duration=m["duration"],
-                transcript=m["transcript"], status="new", analysis_status="pending",
+                transcript=m["transcript"], content_uri=m.get("content_uri"),
+                status="new", analysis_status="pending",
             )
             s.add(row)
             await s.flush()
@@ -179,7 +211,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
             }) for r in stuck)
 
         await s.commit()
-    log.info("fetch: %d new recording(s) after dedup", len(new))
+    log.info("fetch: %d recording(s) inserted/re-queued for analysis", len(new))
 
     # 4) analyse via Agent Factory — NO DB connection held
     sem = asyncio.Semaphore(5)
