@@ -8,8 +8,10 @@ Unlike BT Cloud's call-log API, a raw bucket object has no caller/phone/agent/du
 its own — those are read from the object's S3 user-metadata (`x-amz-meta-caller` etc., set by
 whatever uploads the recording) when present, falling back to the same placeholders bt_client.py
 uses for missing data otherwise. The object key is the dedup key (`ext_id`); `LastModified` is
-the call date. Audio is downloaded and transcribed with the same OpenAI transcription step BT
-Cloud uses (see transcribe.py), then discarded — only the transcript persists.
+the call date. `list_latest` only lists + heads objects (cheap); `transcribe_one` downloads and
+transcribes a single object with the same OpenAI transcription step BT Cloud uses (see
+transcribe.py) — pipeline.py only calls it for objects not already known, so an already-synced
+recording is never re-downloaded on a later sync.
 """
 
 from __future__ import annotations
@@ -72,23 +74,16 @@ def _list_objects(client, *, bucket: str, prefix: str, count: int) -> list[dict]
     return objects[:count]
 
 
-def _to_raw(client, bucket: str, obj: dict) -> dict:
+def _to_meta(client, bucket: str, obj: dict) -> dict:
+    """Object metadata only — a `head_object`, not a `get_object` — so a call already known
+    to the DB never pays for a full download just to be deduped away afterward."""
     key = obj["Key"]
     meta: dict = {}
-    content_type = "audio/mpeg"
     try:
         head = client.head_object(Bucket=bucket, Key=key)
         meta = head.get("Metadata") or {}
-        content_type = head.get("ContentType") or content_type
     except Exception as exc:
         log.warning("head_object failed for %s: %s", key, exc)
-
-    transcript = ""
-    try:
-        body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
-        transcript = transcribe(body, content_type)
-    except Exception as exc:
-        log.warning("download/transcribe failed for object %s: %s", key, exc)
 
     return {
         "ext_id": key,
@@ -97,7 +92,6 @@ def _to_raw(client, bucket: str, obj: dict) -> dict:
         "agent": meta.get("agent") or "Agent",
         "date": obj["LastModified"].date().isoformat(),
         "duration": meta.get("duration") or "",
-        "transcript": transcript or "(no transcript available)",
     }
 
 
@@ -105,19 +99,36 @@ def _to_raw(client, bucket: str, obj: dict) -> dict:
 # Public API — same shape as bt_client.py so pipeline.py can dispatch by source_type
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_latest(
+def list_latest(
     count: int, *, endpoint: str, region: str, bucket: str, prefix: str = "",
     access_key_id: str, secret_access_key: str,
 ) -> list[dict]:
-    """Return up to `count` raw recordings (no AI fields), newest object first. An empty or
-    misconfigured bucket just yields zero results — no demo-data fallback (unlike BT Cloud,
-    there's no meaningful "demo bucket")."""
+    """Return up to `count` recordings' metadata (no transcript, no download), newest object
+    first. An empty or misconfigured bucket just yields zero results — no demo-data fallback
+    (unlike BT Cloud, there's no meaningful "demo bucket")."""
     if not bucket:
         raise ValueError("bucket is required")
     client = _client(endpoint=endpoint, region=region, access_key_id=access_key_id, secret_access_key=secret_access_key)
     objects = _list_objects(client, bucket=bucket, prefix=prefix, count=count)
     log.info("s3_client: %d recording(s) from bucket %s", len(objects), bucket)
-    return [_to_raw(client, bucket, o) for o in objects]
+    return [_to_meta(client, bucket, o) for o in objects]
+
+
+def transcribe_one(
+    item: dict, *, endpoint: str, region: str, bucket: str, access_key_id: str, secret_access_key: str,
+) -> str:
+    """Download and transcribe a single object — only called for items `list_latest` didn't
+    already dedupe away (i.e. never for a call the DB already has)."""
+    client = _client(endpoint=endpoint, region=region, access_key_id=access_key_id, secret_access_key=secret_access_key)
+    key = item["ext_id"]
+    try:
+        obj = client.get_object(Bucket=bucket, Key=key)
+        content_type = obj.get("ContentType") or "audio/mpeg"
+        body = obj["Body"].read()
+        return transcribe(body, content_type) or "(no transcript available)"
+    except Exception as exc:
+        log.warning("download/transcribe failed for object %s: %s", key, exc)
+        return "(no transcript available)"
 
 
 def test_connection(
