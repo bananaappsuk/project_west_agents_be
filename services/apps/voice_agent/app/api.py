@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import agent_client, bt_client, crypto, pipeline, s3_client, transcribe
@@ -102,6 +102,47 @@ async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSessi
                 "createdAt": r.created_at.isoformat() if r.created_at else None,
             })
     return alerts
+
+
+@router.get("/actions")
+async def list_actions(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
+    """Backs the dashboard's "Actions to take" card: a focused list of recordings that
+    need a human decision right now — an AI-drafted reply still awaiting approval, or a
+    call flagged high-risk — as opposed to /alerts (broader: any high-priority OR
+    high-risk call) or /stats (aggregate counts only, no actual items). Column-projected
+    like /alerts and /stats, not full rows — see the comment on /alerts for why."""
+    org = _org(claims)
+    rows = list(await session.execute(
+        select(
+            Recording.id, Recording.label, Recording.caller, Recording.call_date,
+            Recording.category, Recording.priority, Recording.risk,
+            Recording.reply_status, Recording.needs_reply,
+        ).where(
+            Recording.org_id == org,
+            or_(
+                and_(Recording.needs_reply.is_(True), Recording.reply_status.in_(["pending", "edited"])),
+                Recording.risk == "High",
+            ),
+        ).order_by(Recording.call_date.desc())
+    ))
+    items = []
+    for r in rows:
+        reasons = []
+        if r.needs_reply and r.reply_status in ("pending", "edited"):
+            reasons.append("reply")
+        if r.risk == "High":
+            reasons.append("risk")
+        items.append({
+            "id": r.id,
+            "title": r.label or r.caller or "Unknown caller",
+            "date": r.call_date,
+            "category": r.category,
+            "priority": r.priority,
+            "risk": r.risk,
+            "replyStatus": r.reply_status,
+            "reasons": reasons,
+        })
+    return {"count": len(items), "items": items[:20]}
 
 
 @router.post("/recordings/fetch", status_code=status.HTTP_202_ACCEPTED)
@@ -217,27 +258,43 @@ async def relabel_recording(
 
 @router.get("/recordings/{rec_id}/audio")
 async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    """Re-fetches the recording's audio from the bucket on demand — nothing is
-    stored locally (see pipeline.py: audio is discarded right after transcription).
-    Only S3-sourced recordings have anything to serve; BT Cloud's content URL needs
-    a short-lived RingCentral token we never retain, so those 404 here."""
+    """Re-fetches the recording's audio from its source on demand — nothing is stored
+    locally (see pipeline.py: audio is discarded right after transcription). S3-sourced
+    recordings are re-fetched from the bucket; BT Cloud recordings are re-fetched from
+    RingCentral using a fresh/cached access token (see bt_client.fetch_audio) — only
+    possible for recordings synced after content_uri started being captured, with a JWT
+    still configured for the org."""
     org = _org(claims)
     r = await _get_recording(session, org, rec_id)
-    if r.source_type != "s3":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
     cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
-    if not cfg or not cfg.s3_bucket:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured for this org")
-    try:
-        audio, content_type = await run_in_threadpool(
-            s3_client.download,
-            endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
-            access_key_id=cfg.s3_access_key_id,
-            secret_access_key=crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
-            key=r.ext_id,
-        )
-    except Exception as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
+    if r.source_type == "s3":
+        if not cfg or not cfg.s3_bucket:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured for this org")
+        try:
+            audio, content_type = await run_in_threadpool(
+                s3_client.download,
+                endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
+                access_key_id=cfg.s3_access_key_id,
+                secret_access_key=crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
+                key=r.ext_id,
+            )
+        except Exception as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
+    elif r.source_type == "bt_cloud":
+        jwt = crypto.decrypt(cfg.jwt_enc) if (cfg and cfg.jwt_enc) else ""
+        if not r.content_uri or not jwt:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
+        try:
+            audio, content_type = await run_in_threadpool(
+                bt_client.fetch_audio,
+                endpoint=cfg.endpoint, client_id=cfg.client_id,
+                client_secret=crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
+                jwt=jwt, content_uri=r.content_uri,
+            )
+        except Exception as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
+    else:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
     return Response(content=audio, media_type=content_type)
 
 
