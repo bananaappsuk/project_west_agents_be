@@ -43,6 +43,11 @@ class Recording(Base):
     call_date: Mapped[str] = mapped_column(String, default="")   # YYYY-MM-DD (frontend renders as-is)
     duration: Mapped[str] = mapped_column(String, default="")    # "M:SS"
     transcript: Mapped[str] = mapped_column(Text, default="")
+    # BT Cloud recording content URL, captured at fetch time — lets GET /recordings/{id}/audio
+    # re-fetch the audio on demand (with a fresh/cached token) without ever storing the bytes.
+    # Null for S3/upload sources (their `ext_id` already doubles as the storage key) and for
+    # recordings synced before this column existed.
+    content_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     # AI fields (filled by the Agent Factory voice agent)
     summary: Mapped[str] = mapped_column(Text, default="")
     category: Mapped[str] = mapped_column(String, default="General Enquiry")
