@@ -9,7 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import agent_client, bt_client, crypto, pipeline, s3_client, transcribe
+from . import agent_client, bt_client, crm_sync, crypto, pipeline, s3_client, transcribe
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -256,22 +256,20 @@ async def relabel_recording(
     return serialize_recording(r)
 
 
-@router.get("/recordings/{rec_id}/audio")
-async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    """Re-fetches the recording's audio from its source on demand — nothing is stored
+async def _fetch_recording_audio(cfg: VoiceSettings | None, r: Recording) -> tuple[bytes, str]:
+    """Re-fetches a recording's audio from its source on demand — nothing is stored
     locally (see pipeline.py: audio is discarded right after transcription). S3-sourced
     recordings are re-fetched from the bucket; BT Cloud recordings are re-fetched from
     RingCentral using a fresh/cached access token (see bt_client.fetch_audio) — only
     possible for recordings synced after content_uri started being captured, with a JWT
-    still configured for the org."""
-    org = _org(claims)
-    r = await _get_recording(session, org, rec_id)
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    still configured for the org. Shared by GET .../audio (playback) and
+    POST .../retry-analysis (re-transcribing a recording whose transcript never came
+    through)."""
     if r.source_type == "s3":
         if not cfg or not cfg.s3_bucket:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured for this org")
         try:
-            audio, content_type = await run_in_threadpool(
+            return await run_in_threadpool(
                 s3_client.download,
                 endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
                 access_key_id=cfg.s3_access_key_id,
@@ -285,7 +283,7 @@ async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ))
         if not r.content_uri or not jwt:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
         try:
-            audio, content_type = await run_in_threadpool(
+            return await run_in_threadpool(
                 bt_client.fetch_audio,
                 endpoint=cfg.endpoint, client_id=cfg.client_id,
                 client_secret=crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
@@ -295,7 +293,81 @@ async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ))
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
     else:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
+
+
+@router.get("/recordings/{rec_id}/audio")
+async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
+    org = _org(claims)
+    r = await _get_recording(session, org, rec_id)
+    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    audio, content_type = await _fetch_recording_audio(cfg, r)
     return Response(content=audio, media_type=content_type)
+
+
+@router.post("/recordings/{rec_id}/retry-analysis")
+async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
+    """(Re-)transcribes (if the transcript never came through) and (re-)analyzes
+    exactly this one recording — the per-call "Generate summary" action, for a
+    call whose transcript and/or summary is missing (source unreachable at sync
+    time, the LLM call failed, OPENAI_API_KEY unset when it was first synced, ...).
+    Re-fetches audio on demand the same way GET .../audio does — nothing is stored
+    locally between syncs. Goes through the same fields the sync pipeline persists
+    (summary/category/..., CRM sync), not just a bare re-transcribe."""
+    org = _org(claims)
+    if not pipeline.try_claim_analyzing(rec_id):
+        # Already being analyzed by another call (the sync's own post-fetch
+        # analyze step re-queuing this same stuck-pending row, or a second click
+        # landing before the first returned) — reject rather than racing it. See
+        # pipeline.py's `_analyzing` docstring for why a race here would let a
+        # retry that visibly succeeds get silently overwritten back to "failed".
+        raise HTTPException(status.HTTP_409_CONFLICT, "this recording is already being analyzed")
+    try:
+        r = await _get_recording(session, org, rec_id)
+        cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+
+        transcript = r.transcript
+        if not transcript or transcript == "(no transcript available)":
+            audio, content_type = await _fetch_recording_audio(cfg, r)
+            transcript = await run_in_threadpool(transcribe.transcribe, audio, content_type)
+            if not transcript:
+                raise HTTPException(status.HTTP_502_BAD_GATEWAY, "transcription returned no text for this recording")
+            r.transcript = transcript
+
+        r.analysis_status = "pending"
+        await session.commit()
+
+        payload = {
+            "ext_id": r.ext_id, "call_date": r.call_date, "caller": r.caller,
+            "phone": r.phone, "agent": r.agent, "duration": r.duration, "transcript": transcript,
+        }
+        try:
+            res = await agent_client.analyze_call(payload)
+            a = res.get("analysis") or {}
+            ok = True
+        except Exception as exc:
+            log.warning("retry-analysis FAILED rec=%s: %s", rec_id, exc)
+            a, ok = {}, False
+
+        if ok:
+            crm_status, crm_ref, activity_ref = await crm_sync.after_call_analysis(payload, a)
+            r.summary = a.get("summary", "")
+            r.category = a.get("category", "General Enquiry")
+            r.priority = a.get("priority", "Medium")
+            r.risk = a.get("risk", "Low")
+            r.sentiment = a.get("sentiment", "Neutral")
+            r.needs_reply = bool(a.get("needs_reply", False))
+            r.ai_reply = a.get("suggested_reply", "") or ""
+            r.reply_status = "pending" if r.needs_reply else "none"
+            r.analysis_status = "done"
+            r.crm_status, r.crm_reference, r.activity_ref = crm_status, crm_ref, activity_ref
+        else:
+            r.analysis_status = "failed"
+        await session.commit()
+
+        await session.refresh(r)
+        return serialize_recording(r)
+    finally:
+        pipeline.release_analyzing(rec_id)
 
 
 # ---------- human-in-the-loop reply ----------

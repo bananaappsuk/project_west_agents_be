@@ -27,6 +27,35 @@ log = logging.getLogger("voice_agent.pipeline")
 # --workers); the scheduler's own tick-pileup guard defers to this same set.
 _running: set[str] = set()
 
+# In-memory guard against two concurrent analyze attempts for the *same
+# recording* — a manual retry (api.py's /recordings/{id}/retry-analysis)
+# landing while this run's own analyze step (or another retry / a double-click)
+# is still working on it. Without this, both calls independently write their
+# own result and whichever commits last wins regardless of which one actually
+# succeeded, so a retry that visibly succeeds could get silently overwritten
+# back to "failed" moments later. Scoped per-recording, not per-org like
+# `_running`, since analyzing unrelated recordings in the same org concurrently
+# is fine.
+_analyzing: set[str] = set()
+
+
+def is_analyzing(rec_id: str) -> bool:
+    return rec_id in _analyzing
+
+
+def try_claim_analyzing(rec_id: str) -> bool:
+    """Atomically checks-and-claims (safe under asyncio's cooperative scheduling
+    since nothing here awaits) — returns False if already claimed elsewhere."""
+    if rec_id in _analyzing:
+        return False
+    _analyzing.add(rec_id)
+    return True
+
+
+def release_analyzing(rec_id: str) -> None:
+    _analyzing.discard(rec_id)
+
+
 # A row stuck at analysis_status="pending" past this age was inserted by a run
 # that never finished analyzing it (crashed process, killed connection, a very
 # large batch that got interrupted) — since fetch only ever looks at ext_ids it
@@ -217,6 +246,14 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
     sem = asyncio.Semaphore(5)
     payload_by_id = dict(new)
 
+    # Skip (leave "pending") any recording already claimed by a concurrent
+    # analyze attempt — a manual retry (api.py's /recordings/{id}/retry-analysis)
+    # landing on the same recording this run just re-queued (see `_analyzing`'s
+    # docstring). Only ids actually claimed here get released in the `finally`
+    # below, so a skipped id is left for whichever call already owns it to finish.
+    to_analyze = [(rid, p) for rid, p in new if try_claim_analyzing(rid)]
+    claimed = [rid for rid, _ in to_analyze]
+
     async def analyze(rec_id: str, payload: dict):
         async with sem:
             try:
@@ -226,54 +263,58 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 log.warning("analysis FAILED rec=%s: %s", rec_id, exc)
                 return rec_id, {}, False
 
-    results = await asyncio.gather(*(analyze(rid, p) for rid, p in new))
+    try:
+        results = await asyncio.gather(*(analyze(rid, p) for rid, p in to_analyze))
 
-    # CRM forwarding — also NO DB connection held, same principle as analyze
-    # above. A referral/communication submission is an HTTP call that can take
-    # seconds; running it here rather than inside the persist transaction below
-    # means a slow or failing CRM call can never hold a pooled connection open
-    # or roll back rows that already finished processing.
-    async def do_crm(rec_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
-        if not ok:
-            return rec_id, "none", None, None
-        async with sem:
-            status, ref, activity_ref = await crm_sync.after_call_analysis(payload_by_id[rec_id], a)
-            return rec_id, status, ref, activity_ref
+        # CRM forwarding — also NO DB connection held, same principle as analyze
+        # above. A referral/communication submission is an HTTP call that can take
+        # seconds; running it here rather than inside the persist transaction below
+        # means a slow or failing CRM call can never hold a pooled connection open
+        # or roll back rows that already finished processing.
+        async def do_crm(rec_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
+            if not ok:
+                return rec_id, "none", None, None
+            async with sem:
+                status, ref, activity_ref = await crm_sync.after_call_analysis(payload_by_id[rec_id], a)
+                return rec_id, status, ref, activity_ref
 
-    crm_results = await asyncio.gather(*(do_crm(rid, a, ok) for rid, a, ok in results))
-    crm_by_id = {rid: (status, ref, activity_ref) for rid, status, ref, activity_ref in crm_results}
+        crm_results = await asyncio.gather(*(do_crm(rid, a, ok) for rid, a, ok in results))
+        crm_by_id = {rid: (status, ref, activity_ref) for rid, status, ref, activity_ref in crm_results}
 
-    # 5) short txn: persist analysis + record the run + notification
-    high = 0
-    async with SessionLocal() as s:
-        for rec_id, a, ok in results:
-            r = await s.get(Recording, rec_id)
-            if not r:
-                continue
-            if ok:
-                r.summary = a.get("summary", "")
-                r.category = a.get("category", "General Enquiry")
-                r.priority = a.get("priority", "Medium")
-                r.risk = a.get("risk", "Low")
-                r.sentiment = a.get("sentiment", "Neutral")
-                r.needs_reply = bool(a.get("needs_reply", False))
-                r.ai_reply = a.get("suggested_reply", "") or ""
-                r.reply_status = "pending" if r.needs_reply else "none"
-                r.analysis_status = "done"
-                if r.risk == "High":
-                    high += 1
-                r.crm_status, r.crm_reference, r.activity_ref = crm_by_id.get(rec_id, ("none", None, None))
-            else:
-                r.analysis_status = "failed"
-        all_ok = all(ok for _, _, ok in results)
-        run = await s.get(AgentRun, run_id)
-        if run:
-            run.fetched, run.processed, run.high_risk = len(recordings), len(new), high
-            run.status = "success" if all_ok else "partial"
-        if new:
-            source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
-            s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
-        await s.commit()
+        # 5) short txn: persist analysis + record the run + notification
+        high = 0
+        async with SessionLocal() as s:
+            for rec_id, a, ok in results:
+                r = await s.get(Recording, rec_id)
+                if not r:
+                    continue
+                if ok:
+                    r.summary = a.get("summary", "")
+                    r.category = a.get("category", "General Enquiry")
+                    r.priority = a.get("priority", "Medium")
+                    r.risk = a.get("risk", "Low")
+                    r.sentiment = a.get("sentiment", "Neutral")
+                    r.needs_reply = bool(a.get("needs_reply", False))
+                    r.ai_reply = a.get("suggested_reply", "") or ""
+                    r.reply_status = "pending" if r.needs_reply else "none"
+                    r.analysis_status = "done"
+                    if r.risk == "High":
+                        high += 1
+                    r.crm_status, r.crm_reference, r.activity_ref = crm_by_id.get(rec_id, ("none", None, None))
+                else:
+                    r.analysis_status = "failed"
+            all_ok = all(ok for _, _, ok in results)
+            run = await s.get(AgentRun, run_id)
+            if run:
+                run.fetched, run.processed, run.high_risk = len(recordings), len(new), high
+                run.status = "success" if all_ok else "partial"
+            if new:
+                source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
+                s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
+            await s.commit()
+    finally:
+        for rid in claimed:
+            release_analyzing(rid)
 
     log.info("run recorded: org=%s fetched=%d processed=%d high_risk=%d", org_id, len(recordings), len(new), high)
     return [rid for rid, _ in new]
