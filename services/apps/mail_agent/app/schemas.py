@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .models import Email, Folder
 
@@ -43,6 +43,19 @@ class MailboxIn(BaseModel):
     tenantId: str | None = None
     clientId: str | None = None
     clientSecret: str | None = None
+
+    # A stray leading/trailing space (easy to introduce via copy-paste into the
+    # Settings form) changes the string without changing what the user meant —
+    # for `username` specifically, that's also what save_mailbox compares to
+    # decide whether the mailbox identity changed (see api.py), so an
+    # unstripped space there falsely looks like a switch to a different
+    # account and forces a full watermark reset/resync. IMAP/Graph servers
+    # vary in how leniently they treat a padded username, so better to never
+    # send one at all.
+    @field_validator("imapHost", "smtpHost", "username", mode="after")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
 
 
 class AgentConfigIn(BaseModel):
