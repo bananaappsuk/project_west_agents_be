@@ -39,6 +39,11 @@ router = APIRouter(prefix="/orgs", tags=["orgs"])
 DISPLAY_TO_INTERNAL = {"Superadmin": "owner", "Admin": "admin", "User": "user"}
 INTERNAL_TO_DISPLAY = {"owner": "Superadmin", "admin": "Admin", "user": "User"}
 
+# Every org member gets access to both apps, mirroring seed_org.py's behaviour for the
+# initial admin (see scripts/backfill_companion_access.py, which uses this same pairing
+# to fix up accounts that predate this).
+COMPANION_APP = {"mail-agent": "voice-agent", "voice-agent": "mail-agent"}
+
 
 class InviteIn(BaseModel):
     email: EmailStr
@@ -154,6 +159,25 @@ async def invite_member(body: InviteIn, claims: dict = Depends(_require_app_admi
         session.add(membership)
     else:
         membership.roles = [role]
+
+    # Mirror the same role into the companion app (mail-agent <-> voice-agent) so an
+    # invited Superadmin/Admin/User sees both agents, same as the seeded Owner does.
+    companion_key = COMPANION_APP.get(app.key)
+    if companion_key:
+        companion_app = await session.scalar(select(Application).where(Application.key == companion_key))
+        if companion_app:
+            companion_role = await _ensure_role(session, companion_app, org_id, body.role)
+            companion_membership = await session.scalar(
+                select(Membership)
+                .where(
+                    Membership.user_id == user.id, Membership.org_id == org_id, Membership.app_id == companion_app.id,
+                )
+                .options(selectinload(Membership.roles))
+            )
+            if companion_membership is None:
+                session.add(Membership(user_id=user.id, org_id=org_id, app_id=companion_app.id, roles=[companion_role]))
+            else:
+                companion_membership.roles = [companion_role]
 
     # New / not-yet-activated users get a one-time acceptance token (returned once, so the
     # inviter can share the link — there is no email delivery yet).

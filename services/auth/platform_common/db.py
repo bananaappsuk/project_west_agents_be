@@ -33,12 +33,14 @@ def make_db(database_url: str):
         #   on a direct (non-pooled) endpoint.
         connect_args = {"ssl": "require", "statement_cache_size": 0}
 
-    # pool_recycle instead of pool_pre_ping: pre_ping adds a round-trip on every
-    # checkout (painful on a high-latency link); recycling before the provider's
-    # idle-connection cutoff keeps connections healthy without that per-request
-    # cost. 280s was tuned to Neon's ~5-min idle cutoff — re-check this value
-    # against whichever provider's pooler you're actually on (e.g. Supabase's
-    # Supavisor), since a shorter idle timeout there would need a lower number.
-    engine = create_async_engine(database_url, connect_args=connect_args, pool_recycle=280)
+    # pool_recycle(280) alone isn't enough behind Supabase's Supavisor pooler —
+    # its idle-connection cutoff is shorter than the ~5-min one 280s was tuned for
+    # (that number came from Neon), so requests intermittently hit "connection is
+    # closed" / "connection was closed in the middle of operation" on a pooled
+    # connection Supavisor already dropped server-side. pool_pre_ping adds one
+    # cheap round-trip on checkout to catch that before the real query does;
+    # pool_recycle stays as a second line of defense against connections going
+    # stale between checkouts.
+    engine = create_async_engine(database_url, connect_args=connect_args, pool_recycle=280, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return engine, session_factory
