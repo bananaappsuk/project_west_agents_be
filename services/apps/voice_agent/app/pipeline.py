@@ -300,6 +300,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                     r.analysis_status = "done"
                     if r.risk == "High":
                         high += 1
+                    r.intent = a.get("intent") or "NONE"
                     r.crm_status, r.crm_reference, r.activity_ref = crm_by_id.get(rec_id, ("none", None, None))
                 else:
                     r.analysis_status = "failed"

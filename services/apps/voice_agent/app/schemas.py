@@ -60,6 +60,9 @@ def serialize_recording(r: Recording) -> dict:
         "transcript": r.transcript,
         "aiReply": r.ai_reply,
         "analysisStatus": r.analysis_status,
+        "intent": r.intent,
+        "crmStatus": r.crm_status,
+        "crmReference": r.crm_reference,
         "audioAvailable": r.source_type == "s3" or (r.source_type == "bt_cloud" and bool(r.content_uri)),
     }
 

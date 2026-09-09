@@ -58,6 +58,11 @@ class Recording(Base):
     ai_reply: Mapped[str] = mapped_column(Text, default="")
     reply_status: Mapped[str] = mapped_column(String, default="none")   # none|pending|edited|approved|sent|rejected
     analysis_status: Mapped[str] = mapped_column(String, default="pending")  # pending|done|failed
+    # What the AI decided this call was asking for — independent of `category`
+    # (a generic triage label). Drives crm_sync.py's branching; persisted here
+    # (mirroring mail_agent's Email.intent) so the UI can show *why* crm_status
+    # is what it is, not just the bare outcome.
+    intent: Mapped[str] = mapped_column(String, default="NONE")  # NONE|REFERRAL|CASE_COMMUNICATION|RESCHEDULE|CANCEL
     # CRM intake (pw-crm-be) outcome for this call's detected intent, if any.
     crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
     crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref

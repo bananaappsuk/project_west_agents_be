@@ -359,6 +359,7 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
             r.ai_reply = a.get("suggested_reply", "") or ""
             r.reply_status = "pending" if r.needs_reply else "none"
             r.analysis_status = "done"
+            r.intent = a.get("intent") or "NONE"
             r.crm_status, r.crm_reference, r.activity_ref = crm_status, crm_ref, activity_ref
         else:
             r.analysis_status = "failed"
