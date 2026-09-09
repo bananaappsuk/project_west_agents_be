@@ -407,11 +407,31 @@ async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), 
         else (mailbox.client_secret_enc if mailbox else None)
     )
     if mailbox:
+        # Changing which mailbox we're pointed at (a different account/host, or a
+        # provider switch) makes the stored sync watermark meaningless — it was
+        # scoped to the *old* mailbox's UID numbering (IMAP) or timestamp cursor
+        # (Graph). Left in place, the next sync narrows its search by that stale
+        # cursor and comes back looking like nothing new ever arrived, even though
+        # the new mailbox has never actually been synced. A password-only change
+        # (import stays on the same account) must NOT reset this — that would
+        # force a needless full rescan on every credential rotation.
+        identity_changed = (
+            mailbox.provider != body.provider
+            or mailbox.username != body.username
+            or (body.provider == "graph" and (
+                mailbox.tenant_id != body.tenantId or mailbox.client_id != body.clientId
+            ))
+            or (body.provider != "graph" and mailbox.imap_host != body.imapHost)
+        )
         mailbox.imap_host, mailbox.imap_port = body.imapHost, body.imapPort
         mailbox.smtp_host, mailbox.smtp_port = body.smtpHost, body.smtpPort
         mailbox.username, mailbox.password_enc, mailbox.enabled = body.username, enc, True
         mailbox.provider = body.provider
         mailbox.tenant_id, mailbox.client_id, mailbox.client_secret_enc = body.tenantId, body.clientId, client_secret_enc
+        if identity_changed:
+            mailbox.last_synced_uid = None
+            mailbox.last_synced_at = None
+            mailbox.uid_validity = None
     else:
         session.add(Mailbox(
             org_id=org, imap_host=body.imapHost, imap_port=body.imapPort,
