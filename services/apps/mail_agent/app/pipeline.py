@@ -443,19 +443,29 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
             messages, watermark_advance, fetched_uid_validity = await run_in_threadpool(
                 mail_client.fetch_latest, count=batch_cap, known_uids=known_uids, since_uid=since_uid, **creds
             )
-            if current_uid_validity is not None and fetched_uid_validity and fetched_uid_validity != current_uid_validity:
-                # A real IMAP UIDVALIDITY reset (mailbox rebuild/migration on the
-                # server) — UID numbers started over, so `since_uid` (scoped to the
-                # *old* numbering) is now meaningless, and this batch's `messages`
-                # were fetched using it, so they can't be trusted either. Adopt the
-                # new epoch, persist it + clear the watermark immediately (so a
-                # crash right after this doesn't lose the update), and restart the
-                # loop to refetch cleanly from the start of the new epoch.
+            if fetched_uid_validity and fetched_uid_validity != current_uid_validity:
+                # The epoch this batch just fetched under doesn't match what
+                # `known_uids` (computed above, before this fetch) was scoped to —
+                # either a real IMAP UIDVALIDITY reset (mailbox rebuild/migration on
+                # the server) with `current_uid_validity` a stale real value, or this
+                # mailbox has no *stored* baseline yet (`current_uid_validity` is
+                # None: a first-ever sync, or a mailbox whose watermark was just
+                # reset because Settings pointed it at a different account) while
+                # rows already exist in the DB under a real epoch — e.g. switching
+                # back to a previously-synced account, or an entirely different
+                # mailbox that happens to report the same low UIDVALIDITY a fresh
+                # mailbox typically starts at. Either way, `since_uid` (scoped to
+                # the old/absent epoch) is meaningless now and this batch's
+                # `messages` were deduped against the wrong `known_uids`, so they
+                # can't be trusted — adopt the new epoch, persist it + clear the
+                # watermark immediately (so a crash right after this doesn't lose
+                # the update), and restart the loop to refetch (and re-dedup)
+                # cleanly against the newly-adopted epoch.
                 log.warning(
-                    "org=%s: IMAP UIDVALIDITY changed (%s -> %s) — mailbox UID numbering was "
-                    "reset server-side; resetting the sync watermark and starting a fresh UID "
-                    "epoch so a reused UID is never mistaken for an already-imported message",
-                    org_id, current_uid_validity, fetched_uid_validity,
+                    "org=%s: IMAP UIDVALIDITY is %s (was %s) — (re)establishing the sync "
+                    "epoch and resetting the watermark so a stored UID under this epoch is "
+                    "never mistaken for a new message, nor a new message silently dropped",
+                    org_id, fetched_uid_validity, current_uid_validity,
                 )
                 current_uid_validity = fetched_uid_validity
                 since_uid = None
@@ -466,8 +476,6 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                         mb.last_synced_uid = None
                     await s.commit()
                 continue
-            if fetched_uid_validity and current_uid_validity is None:
-                current_uid_validity = fetched_uid_validity  # first baseline for this mailbox
         log.info("org=%s batch=%d: pulled %d message(s)", org_id, batch_num, len(messages))
         if not messages:
             break
