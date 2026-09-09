@@ -18,7 +18,7 @@ def _headers() -> dict[str, str]:
 
 
 async def submit_referral(payload: dict) -> dict:
-    """POST /intake/referral — returns {submission_ref, status, duplicate, missing_fields, needs_completion}."""
+    """POST /intake/referral — returns {reference, status, duplicate, missing_fields, needs_completion}."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(f"{settings.crm_base_url}/intake/referral", json=payload, headers=_headers())
         resp.raise_for_status()
@@ -26,9 +26,25 @@ async def submit_referral(payload: dict) -> dict:
 
 
 async def submit_communication(payload: dict) -> dict:
-    """POST /intake/communication — returns {..., change_request_id} when a reschedule/cancel was raised."""
+    """POST /intake/communication — a contact against an existing case with nothing to
+    action beyond logging it. Returns {..., change_request_id: null} — a reschedule/
+    cancel can no longer be raised through this endpoint (see submit_change_request);
+    sending request_type/meeting_reference/etc. here, or category CHANGE_OR_CANCEL_SESSION/
+    CANCELLATION, now 422s."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(f"{settings.crm_base_url}/intake/communication", json=payload, headers=_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def submit_change_request(payload: dict) -> dict:
+    """POST /intake/change-request — the only endpoint that can raise a change request
+    (a family asking to move or cancel a session). Requires case_ref, meeting_reference,
+    and request_type (RESCHEDULE|CANCEL|OTHER) — no fallback if the session can't be
+    identified; see crm_sync.py for what happens then. Returns
+    {change_request_id, communication_id, case_ref, duplicate, message}."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{settings.crm_base_url}/intake/change-request", json=payload, headers=_headers())
         resp.raise_for_status()
         return resp.json()
 

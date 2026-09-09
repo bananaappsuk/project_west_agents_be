@@ -140,23 +140,59 @@ async def after_call_analysis(recording_payload: dict, analysis: dict) -> tuple[
                 "source_payload": {"call_ext_id": ext_id, "handled_by": agent},
             }
             res = await crm_client.submit_referral(payload)
-            crm_reference = res.get("submission_ref")
+            crm_reference = res.get("reference")
             crm_status = "sent"
             outcome, outcome_reference = "REFERRAL_CREATED", crm_reference
 
         elif intent in _COMMUNICATION_INTENTS:
             case_ref = analysis.get("case_ref") or None
-            if not case_ref:
+
+            if intent in ("RESCHEDULE", "CANCEL"):
+                # A session/booking change goes through /intake/change-request and only
+                # that endpoint — /intake/communication now 422s on request_type/
+                # meeting_reference/etc., and refuses category CHANGE_OR_CANCEL_SESSION/
+                # CANCELLATION outright (CRM Integration Guide v2 §4/§5, rule 2).
+                meeting_reference = analysis.get("meeting_reference") or None
+                if case_ref and meeting_reference:
+                    payload = {
+                        "case_ref": case_ref,
+                        "meeting_reference": meeting_reference,
+                        "request_type": intent,
+                        "channel": "CALL",
+                        "occurred_at": occurred_at,
+                        "summary": summary,
+                        "participant_name": caller,
+                        "participant_address": phone,
+                        "duration_seconds": _duration_seconds(duration),
+                        "external_ref": ext_id,
+                        "source_payload": {"handled_by": agent},
+                    }
+                    if analysis.get("preferred_start_at"):
+                        payload["preferred_start_at"] = analysis["preferred_start_at"]
+                    res = await crm_client.submit_change_request(payload)
+                    crm_status, crm_reference = "sent", case_ref
+                    outcome = "CHANGE_REQUEST_RAISED"
+                    outcome_reference = res.get("change_request_id") or case_ref
+                else:
+                    # Can't identify the session (or even the case) to raise a change
+                    # against — rule 3: don't force it through §4, log the contact and
+                    # let a coordinator resolve it instead of guessing.
+                    log.info(
+                        "%s downgraded to activity-only, missing %s: recording ext_id=%s",
+                        intent, "case_ref" if not case_ref else "meeting_reference", ext_id,
+                    )
+                    crm_status = "skipped"
+                    outcome = "SKIPPED_NO_CASE"
+            elif not case_ref:
                 log.info("communication skipped, no case_ref found: recording ext_id=%s", ext_id)
                 crm_status = "skipped"
                 outcome = "SKIPPED_NO_CASE"
             else:
-                is_change = intent in ("RESCHEDULE", "CANCEL") and bool(analysis.get("meeting_reference"))
                 payload = {
                     "case_ref": case_ref,
                     "channel": "CALL",
                     "direction": "INBOUND",
-                    "category": "CHANGE_OR_CANCEL_SESSION" if is_change else "EXISTING_CASE",
+                    "category": "EXISTING_CASE",
                     "occurred_at": occurred_at,
                     "summary": summary,
                     "duration_seconds": _duration_seconds(duration),
@@ -165,27 +201,9 @@ async def after_call_analysis(recording_payload: dict, analysis: dict) -> tuple[
                     "external_ref": ext_id,
                     "source_payload": {"handled_by": agent},
                 }
-                if is_change:
-                    payload["meeting_reference"] = analysis["meeting_reference"]
-                    payload["request_type"] = intent
-                    if intent == "RESCHEDULE" and analysis.get("preferred_start_at"):
-                        payload["preferred_start_at"] = analysis["preferred_start_at"]
-                elif intent in ("RESCHEDULE", "CANCEL"):
-                    # Case is known but the AI couldn't pin down which meeting —
-                    # log it as a plain communication against the case rather than
-                    # dropping it outright; a coordinator still needs to see it.
-                    log.info(
-                        "change request downgraded to plain communication, no meeting_reference: recording ext_id=%s",
-                        ext_id,
-                    )
-
                 res = await crm_client.submit_communication(payload)
                 crm_status, crm_reference = "sent", case_ref
-                if is_change:
-                    outcome = "CHANGE_REQUEST_RAISED"
-                    outcome_reference = res.get("change_request_id") or case_ref
-                else:
-                    outcome, outcome_reference = "COMMUNICATION_LOGGED", case_ref
+                outcome, outcome_reference = "COMMUNICATION_LOGGED", case_ref
     except Exception as exc:
         log.warning("CRM submission failed: recording ext_id=%s intent=%s: %s", ext_id, intent, exc)
         crm_status = "failed"
