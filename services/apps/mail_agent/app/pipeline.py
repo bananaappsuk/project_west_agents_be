@@ -378,6 +378,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
             log.warning("fetch aborted: org=%s has no enabled mailbox", org_id)
             raise LookupError("no mailbox configured for this org")
         mailbox_id = mailbox.id
+        sync_epoch = mailbox.sync_epoch
         provider = mailbox.provider
         if provider == "graph":
             creds = {
@@ -413,11 +414,17 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
         # pulls from the very start of the mailbox's history.
 
         # The UID epoch dedup is currently scoped to (see _known_uids/Email.uid_validity).
-        # Graph ids need no epoch tracking — "graph" is a fixed sentinel, never reset.
-        # For IMAP, None means no baseline established yet (first sync since this
-        # column was added, or ever); the batch loop below adopts whatever the
-        # server reports as the baseline the first time it sees one.
-        current_uid_validity = "graph" if provider == "graph" else mailbox.uid_validity
+        # Graph ids need no server-side epoch tracking, but are still namespaced by
+        # `sync_epoch` (a fixed "graph" sentinel, undifferentiated across mailbox
+        # generations, risked a stale-account's Graph rows being lumped in with a
+        # newly-connected one, same class of bug as the IMAP case below — see
+        # Mailbox.sync_epoch's docstring). For IMAP, None means no baseline
+        # established yet for this generation (first sync ever, or the first since
+        # Settings pointed this mailbox at a different account); the batch loop
+        # below adopts whatever the server reports as the baseline the first time
+        # it sees one, folding in `sync_epoch` so that baseline can never collide
+        # with a prior generation's epoch even if the server's own report does.
+        current_uid_validity = f"{sync_epoch}:graph" if provider == "graph" else mailbox.uid_validity
 
     sem = asyncio.Semaphore(_ANALYZE_CONCURRENCY)
     all_new_ids: list[str] = []
@@ -443,7 +450,10 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
             messages, watermark_advance, fetched_uid_validity = await run_in_threadpool(
                 mail_client.fetch_latest, count=batch_cap, known_uids=known_uids, since_uid=since_uid, **creds
             )
-            if fetched_uid_validity and fetched_uid_validity != current_uid_validity:
+            # Namespaced by `sync_epoch` (see Mailbox.sync_epoch's docstring) —
+            # never compare/adopt/persist the server's raw report directly.
+            namespaced_uid_validity = f"{sync_epoch}:{fetched_uid_validity}" if fetched_uid_validity else None
+            if namespaced_uid_validity and namespaced_uid_validity != current_uid_validity:
                 # The epoch this batch just fetched under doesn't match what
                 # `known_uids` (computed above, before this fetch) was scoped to —
                 # either a real IMAP UIDVALIDITY reset (mailbox rebuild/migration on
@@ -462,12 +472,12 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                 # the update), and restart the loop to refetch (and re-dedup)
                 # cleanly against the newly-adopted epoch.
                 log.warning(
-                    "org=%s: IMAP UIDVALIDITY is %s (was %s) — (re)establishing the sync "
+                    "org=%s: sync epoch is now %s (was %s) — (re)establishing the sync "
                     "epoch and resetting the watermark so a stored UID under this epoch is "
                     "never mistaken for a new message, nor a new message silently dropped",
-                    org_id, fetched_uid_validity, current_uid_validity,
+                    org_id, namespaced_uid_validity, current_uid_validity,
                 )
-                current_uid_validity = fetched_uid_validity
+                current_uid_validity = namespaced_uid_validity
                 since_uid = None
                 async with SessionLocal() as s:
                     mb = await s.get(Mailbox, mailbox_id)

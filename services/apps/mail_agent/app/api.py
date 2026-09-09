@@ -432,6 +432,9 @@ async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), 
             mailbox.last_synced_uid = None
             mailbox.last_synced_at = None
             mailbox.uid_validity = None
+            # New generation — see Mailbox.sync_epoch's docstring for why this
+            # can't just rely on the provider reporting a fresh UIDVALIDITY.
+            mailbox.sync_epoch = (mailbox.sync_epoch or 0) + 1
     else:
         session.add(Mailbox(
             org_id=org, imap_host=body.imapHost, imap_port=body.imapPort,

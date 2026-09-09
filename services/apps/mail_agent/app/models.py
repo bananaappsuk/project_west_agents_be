@@ -127,6 +127,17 @@ class Mailbox(Base):
     # for why this matters) — NULL until the first sync after this column was
     # added establishes a baseline. Not used for Graph mailboxes.
     uid_validity: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Bumped whenever Settings points this mailbox at a materially different
+    # connection (see api.py's save_mailbox `identity_changed`). Folded into the
+    # epoch string used for dedup scoping (pipeline.py's `current_uid_validity`)
+    # so that a coincidentally-identical server-reported UIDVALIDITY across two
+    # different mailbox generations (observed in practice: a provider does not
+    # always bump UIDVALIDITY on what amounts to a full UID renumbering) can
+    # never cause a new generation to be mistaken for a continuation of the old
+    # one — without this, a genuinely new message landing on a UID number a
+    # prior generation already used would be silently treated as a duplicate
+    # and dropped instead of imported.
+    sync_epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class AgentConfig(Base):
