@@ -192,6 +192,15 @@ async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), s
     everywhere else, so this gets the full result (confidence, needs_reply,
     auto-reply draft, CRM sync, ...), not just summary/category/priority."""
     org = _org(claims)
+    if pipeline.is_analyzing(email_id):
+        # Already being analyzed by another call (a sync's own post-fetch
+        # auto-analyze, a backlog catch-up, or a second click landing before the
+        # first returned) — reject rather than racing it. Two concurrent
+        # attempts would each flip the row to "pending" and run their own LLM
+        # call, and whichever commits last wins regardless of which one
+        # actually succeeded, so a retry that visibly succeeds could get
+        # silently overwritten back to "failed" moments later.
+        raise HTTPException(status.HTTP_409_CONFLICT, "this email is already being analyzed")
     e = await _get_email(session, org, email_id)
     e.summary_status = "pending"
     payload = serialize_email(e)

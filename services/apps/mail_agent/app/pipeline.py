@@ -57,6 +57,21 @@ def _send_fn_for(provider: str):
 # tick-pileup guard defers to this same set.
 _running: set[str] = set()
 
+# In-memory guard against two concurrent analyze attempts for the *same email* —
+# a manual retry-summary click racing the sync's own post-fetch auto-analyze (or
+# a double-click on Retry, since neither path is otherwise mutually exclusive
+# with `_running` above). Without this, both calls independently flip the row to
+# "pending", each runs its own LLM call, and whichever commits its result last
+# wins regardless of which one actually succeeded — so a retry that visibly
+# succeeds can be silently overwritten back to "failed" moments later by a
+# slower losing attempt. Scoped per-email (not per-org, like `_running`) since
+# analyzing unrelated emails in the same org concurrently is fine.
+_analyzing: set[str] = set()
+
+
+def is_analyzing(email_id: str) -> bool:
+    return email_id in _analyzing
+
 # A row stuck at summary_status="pending" past this age was picked up by an
 # analysis pass that never finished it (crashed process, killed connection) —
 # eligible for pickup again, same as a freshly-"skipped" row (see
@@ -173,103 +188,115 @@ async def analyze_and_persist(
     a detected intent still files to the CRM, just without attachments."""
     if not rows:
         return 0, 0, True
-    sem = sem or asyncio.Semaphore(_ANALYZE_CONCURRENCY)
+    # Skip any email already being analyzed by a concurrent call — see
+    # `_analyzing`'s docstring. Only ids we actually claim here get released in
+    # the `finally` below, so a skipped id is left untouched for whichever call
+    # already owns it to finish.
+    rows = [(eid, p) for eid, p in rows if eid not in _analyzing]
+    if not rows:
+        return 0, 0, True
+    claimed = [eid for eid, _ in rows]
+    _analyzing.update(claimed)
+    try:
+        sem = sem or asyncio.Semaphore(_ANALYZE_CONCURRENCY)
 
-    async def analyze(email_id: str, payload: dict) -> tuple[str, dict, bool, bool]:
-        async with sem:
-            try:
-                res = await agent_client.analyze_email(payload)
-                a = res.get("analysis") or {}
-                log.info("analyzed uid=%s -> %s/%s", payload.get("uid"), a.get("category"), a.get("priority"))
-                return email_id, a, bool(res.get("auto_sendable")), True
-            except Exception as exc:
-                log.warning("analysis FAILED uid=%s: %s", payload.get("uid"), exc)
-                return email_id, {}, False, False
+        async def analyze(email_id: str, payload: dict) -> tuple[str, dict, bool, bool]:
+            async with sem:
+                try:
+                    res = await agent_client.analyze_email(payload)
+                    a = res.get("analysis") or {}
+                    log.info("analyzed uid=%s -> %s/%s", payload.get("uid"), a.get("category"), a.get("priority"))
+                    return email_id, a, bool(res.get("auto_sendable")), True
+                except Exception as exc:
+                    log.warning("analysis FAILED uid=%s: %s", payload.get("uid"), exc)
+                    return email_id, {}, False, False
 
-    results = await asyncio.gather(*(analyze(eid, p) for eid, p in rows))
+        results = await asyncio.gather(*(analyze(eid, p) for eid, p in rows))
 
-    # Auto-send eligible replies via Graph or SMTP (matching the mailbox's read
-    # provider) — NO DB connection held, same principle as the analyze step (a
-    # slow network call must never sit inside an open transaction). `rows`'
-    # serialized payloads already carry fromEmail/subject, so this needs no
-    # extra DB read.
-    payload_by_id = {eid: p for eid, p in rows}
-    send_fn = _send_fn_for(provider)
+        # Auto-send eligible replies via Graph or SMTP (matching the mailbox's read
+        # provider) — NO DB connection held, same principle as the analyze step (a
+        # slow network call must never sit inside an open transaction). `rows`'
+        # serialized payloads already carry fromEmail/subject, so this needs no
+        # extra DB read.
+        payload_by_id = {eid: p for eid, p in rows}
+        send_fn = _send_fn_for(provider)
 
-    async def maybe_send(email_id: str, a: dict, auto_sendable: bool, ok: bool) -> tuple[str, dict, bool, bool]:
-        if not (ok and auto_reply_enabled and auto_sendable and a.get("needs_reply")):
-            return email_id, a, ok, False
-        payload = payload_by_id[email_id]
-        async with sem:
-            try:
-                await run_in_threadpool(
-                    send_fn,
-                    **send_creds, to_addr=payload["fromEmail"],
-                    subject=f"Re: {payload['subject']}", body=a.get("suggested_reply", "") or "",
-                )
-                return email_id, a, ok, True
-            except Exception as exc:
-                log.warning("auto-send FAILED uid=%s: %s — falling back to draft", payload.get("uid"), exc)
+        async def maybe_send(email_id: str, a: dict, auto_sendable: bool, ok: bool) -> tuple[str, dict, bool, bool]:
+            if not (ok and auto_reply_enabled and auto_sendable and a.get("needs_reply")):
                 return email_id, a, ok, False
+            payload = payload_by_id[email_id]
+            async with sem:
+                try:
+                    await run_in_threadpool(
+                        send_fn,
+                        **send_creds, to_addr=payload["fromEmail"],
+                        subject=f"Re: {payload['subject']}", body=a.get("suggested_reply", "") or "",
+                    )
+                    return email_id, a, ok, True
+                except Exception as exc:
+                    log.warning("auto-send FAILED uid=%s: %s — falling back to draft", payload.get("uid"), exc)
+                    return email_id, a, ok, False
 
-    sent_results = await asyncio.gather(*(maybe_send(eid, a, auto_sendable, ok) for eid, a, auto_sendable, ok in results))
+        sent_results = await asyncio.gather(*(maybe_send(eid, a, auto_sendable, ok) for eid, a, auto_sendable, ok in results))
 
-    # CRM forwarding — also NO DB connection held, same principle as analyze/
-    # maybe_send above. A referral/communication submission (plus any attachment
-    # upload ahead of it) is an HTTP call that can take seconds; running it here
-    # rather than inside the persist transaction below means a slow or failing
-    # CRM call can never hold a pooled connection open or roll back rows that
-    # already finished processing.
-    async def do_crm(email_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
-        if not ok:
-            return email_id, "none", None, None
-        async with sem:
-            status, ref, activity_ref = await crm_sync.after_email_analysis(
-                payload_by_id[email_id], a, (attachments_by_id or {}).get(email_id)
-            )
-            return email_id, status, ref, activity_ref
+        # CRM forwarding — also NO DB connection held, same principle as analyze/
+        # maybe_send above. A referral/communication submission (plus any attachment
+        # upload ahead of it) is an HTTP call that can take seconds; running it here
+        # rather than inside the persist transaction below means a slow or failing
+        # CRM call can never hold a pooled connection open or roll back rows that
+        # already finished processing.
+        async def do_crm(email_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
+            if not ok:
+                return email_id, "none", None, None
+            async with sem:
+                status, ref, activity_ref = await crm_sync.after_email_analysis(
+                    payload_by_id[email_id], a, (attachments_by_id or {}).get(email_id)
+                )
+                return email_id, status, ref, activity_ref
 
-    crm_results = await asyncio.gather(*(do_crm(eid, a, ok) for eid, a, ok, _sent in sent_results))
-    crm_by_id = {eid: (status, ref, activity_ref) for eid, status, ref, activity_ref in crm_results}
+        crm_results = await asyncio.gather(*(do_crm(eid, a, ok) for eid, a, ok, _sent in sent_results))
+        crm_by_id = {eid: (status, ref, activity_ref) for eid, status, ref, activity_ref in crm_results}
 
-    high = 0
-    async with SessionLocal() as s:
-        for email_id, a, ok, sent in sent_results:
-            e = await s.get(Email, email_id)
-            if not e:
-                continue
-            if ok:
-                e.summary = a.get("summary", "")
-                e.category = a.get("category", "")
-                e.priority = a.get("priority", "Medium")
-                e.confidence = a.get("confidence", 0.0)
-                e.needs_reply = bool(a.get("needs_reply", False))
-                e.summary_status = "done"
-                if e.priority == "High":
-                    high += 1
-                e.intent = a.get("intent") or "NONE"
-                e.crm_status, e.crm_reference, e.activity_ref = crm_by_id.get(email_id, ("none", None, None))
+        high = 0
+        async with SessionLocal() as s:
+            for email_id, a, ok, sent in sent_results:
+                e = await s.get(Email, email_id)
+                if not e:
+                    continue
+                if ok:
+                    e.summary = a.get("summary", "")
+                    e.category = a.get("category", "")
+                    e.priority = a.get("priority", "Medium")
+                    e.confidence = a.get("confidence", 0.0)
+                    e.needs_reply = bool(a.get("needs_reply", False))
+                    e.summary_status = "done"
+                    if e.priority == "High":
+                        high += 1
+                    e.intent = a.get("intent") or "NONE"
+                    e.crm_status, e.crm_reference, e.activity_ref = crm_by_id.get(email_id, ("none", None, None))
 
-                suggested_reply = a.get("suggested_reply", "") or ""
-                if not e.needs_reply:
-                    pass  # reply_status stays "none"
-                elif sent:
-                    e.draft_reply = suggested_reply
-                    e.reply_status = "sent"
-                    e.auto_sent = True
+                    suggested_reply = a.get("suggested_reply", "") or ""
+                    if not e.needs_reply:
+                        pass  # reply_status stays "none"
+                    elif sent:
+                        e.draft_reply = suggested_reply
+                        e.reply_status = "sent"
+                        e.auto_sent = True
+                    else:
+                        # Either not auto-sendable (needs a human), or the send
+                        # attempt itself failed — either way, land it as a draft
+                        # rather than losing the AI's suggested reply.
+                        e.draft_reply = suggested_reply
+                        e.reply_status = "draft"
                 else:
-                    # Either not auto-sendable (needs a human), or the send
-                    # attempt itself failed — either way, land it as a draft
-                    # rather than losing the AI's suggested reply.
-                    e.draft_reply = suggested_reply
-                    e.reply_status = "draft"
-            else:
-                e.summary_status = "failed"
-        await s.commit()
+                    e.summary_status = "failed"
+            await s.commit()
 
-    ok_count = sum(1 for _, _, ok, _ in sent_results if ok)
-    all_ok = all(ok for _, _, ok, _ in sent_results)
-    return ok_count, high, all_ok
+        ok_count = sum(1 for _, _, ok, _ in sent_results if ok)
+        all_ok = all(ok for _, _, ok, _ in sent_results)
+        return ok_count, high, all_ok
+    finally:
+        _analyzing.difference_update(claimed)
 
 
 async def analyze_backlog(org_id: str, count: int = _BACKLOG_ANALYZE_DEFAULT) -> dict:
