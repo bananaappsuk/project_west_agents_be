@@ -54,7 +54,8 @@ class User(Base):
     # Legacy: unused since sign-in moved to Microsoft Entra ID. Kept (nullable) so
     # pre-Entra rows load; new rows leave it empty.
     password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
-    # Entra object id (`oid`) — the only thing /auth/entra looks users up by.
+    # Entra object id (`oid`) — what /auth/entra looks users up by. Set on first sign-in
+    # (a pre-Entra row is bound by UPN = email once; see routers/entra.py).
     entra_oid: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
     entra_upn: Mapped[str | None] = mapped_column(String, nullable=True)
     full_name: Mapped[str | None] = mapped_column(String, nullable=True)

@@ -4,7 +4,8 @@
 -- run multiple times.
 --
 -- Why: sign-in moved from email/password to Microsoft Entra ID (POST /auth/entra).
--- Users are now looked up by their immutable Entra object id (`oid`), never by email.
+-- Users are now looked up by their immutable Entra object id (`oid`). An existing row is
+-- bound to its Entra account once, on first sign-in (UPN = email; see routers/entra.py).
 
 -- 1. Link columns. entra_oid is unique: one local user per Entra user.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS entra_oid VARCHAR;

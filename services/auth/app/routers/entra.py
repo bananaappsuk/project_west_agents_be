@@ -2,7 +2,7 @@
 
 The frontend signs the user in with MSAL and POSTs the access token it got for
 `api://<client-id>/access_as_user` as a Bearer header. We verify it (app/entra.py),
-find the user by Entra object id (`oid`) only, sync their Entra app role into
+find the user by Entra object id (`oid`), sync their Entra app role into
 their memberships for every agent app, and return platform tokens for each app —
 so the gateway and every downstream service keep verifying our own JWTs unchanged.
 
@@ -10,6 +10,8 @@ Entra is the source of truth for access:
 - the enterprise app has "Assignment required", so only assigned staff get a token;
 - the `roles` claim (Agents.Superadmin / Agents.Admin / Agents.User) sets the role,
   re-synced on every sign-in; no role → no access (never a default role);
+- a pre-Entra user row is bound to its Entra account on first sign-in (UPN = email,
+  our tenant, row not already bound) — from then on it's found by `oid`;
 - an assigned user with no local row is provisioned on first sign-in.
 """
 
@@ -22,6 +24,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..config import settings
 from ..db import get_session
 from ..entra import EntraTokenError, verify_access_token
 from ..models import Application, Membership, Organization, RefreshToken, Role, User
@@ -68,6 +71,41 @@ async def _revoke_access(session: AsyncSession, user: User) -> None:
     await session.commit()
 
 
+async def _bind_existing(session: AsyncSession, claims: dict, oid: str, upn: str) -> User | None:
+    """Bind-on-first-sign-in for pre-Entra accounts: a users row whose email equals
+    the token's UPN (case-insensitive) and has no entra_oid yet gets this oid.
+    Returns None when no row matches (caller provisions). Every bind is logged."""
+    rows = list(await session.scalars(select(User).where(func.lower(User.email) == upn.lower())))
+    if not rows:
+        return None
+    if len(rows) > 1:
+        log.warning("AUDIT entra bind refused: %d users share email %s (token oid %s)", len(rows), upn, oid)
+        raise HTTPException(status.HTTP_409_CONFLICT, "More than one account uses this email. Ask an administrator.")
+    user = rows[0]
+    if user.entra_oid:
+        # Found by email but not by oid → already bound to a different Microsoft account.
+        log.warning(
+            "AUDIT entra bind refused: user %s (%s) is bound to oid %s, token oid %s",
+            user.id, user.email, user.entra_oid, oid,
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This account is already linked to a different Microsoft account. Ask an administrator.",
+        )
+    # Already enforced by verify_access_token; re-checked here because a bind is permanent.
+    if claims.get("tid") != settings.entra_tenant_id:
+        log.warning("AUDIT entra bind refused: user %s (%s), token tid %s", user.id, user.email, claims.get("tid"))
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token is from a different tenant")
+
+    user.entra_oid = oid
+    user.entra_upn = upn
+    log.info(
+        "AUDIT entra bind: user %s (%s) bound to oid %s upn %s tid %s",
+        user.id, user.email, oid, upn, claims["tid"],
+    )
+    return user
+
+
 async def _find_or_provision_user(session: AsyncSession, claims: dict) -> User:
     oid = claims["oid"]
     upn = claims.get("upn") or claims.get("preferred_username")
@@ -75,23 +113,24 @@ async def _find_or_provision_user(session: AsyncSession, claims: dict) -> User:
     name = claims.get("name")
 
     user = await session.scalar(select(User).where(User.entra_oid == oid))
+    if user is None and upn:
+        user = await _bind_existing(session, claims, oid, upn)
     if user is None:
         if not email:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Microsoft token carries no email or UPN")
-        # Lookup is by oid only. A local row that already holds this email but isn't
-        # linked to this oid is a pre-Entra account that scripts/map_entra_users.py
-        # hasn't linked yet (or a clash) — refuse rather than guess.
+        # The UPN matched no row, but the email claim does (UPN ≠ email): not a bind
+        # rule we accept — refuse rather than guess.
         if await session.scalar(select(User).where(func.lower(User.email) == email)):
-            log.warning("entra sign-in: unlinked local account for %s (oid %s)", email, oid)
+            log.warning("AUDIT entra sign-in refused: %s exists but doesn't match UPN %s (oid %s)", email, upn, oid)
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                "An existing account with this email hasn't been linked to Microsoft sign-in yet. "
-                "Ask an administrator to link it.",
+                "An existing account uses this email but doesn't match your Microsoft sign-in name. "
+                "Ask an administrator.",
             )
         user = User(email=email, full_name=name, entra_oid=oid, entra_upn=upn, is_active=True)
         session.add(user)
         await session.flush()
-        log.info("entra sign-in: provisioned %s (oid %s)", email, oid)
+        log.info("AUDIT entra sign-in: provisioned %s (oid %s)", email, oid)
         return user
 
     # Keep profile fields in step with Entra.

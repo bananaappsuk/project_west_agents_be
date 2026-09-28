@@ -1,8 +1,12 @@
-"""One-time: link existing (pre-Entra) users to their Microsoft Entra ID accounts.
+"""Optional, not part of the rollout: bulk-link existing (pre-Entra) users to their
+Microsoft Entra ID accounts ahead of time.
+
+Not needed normally — /auth/entra binds a pre-Entra row on its first sign-in
+(routers/entra.py). Kept for bulk pre-linking, or for accounts whose email isn't
+their UPN (which bind-on-first-sign-in deliberately won't match).
 
 After this, /auth/entra finds these users by Entra object id (`oid`) and keeps
-their existing user id — so anything keyed to it carries over. It's the only place
-email is used to match; sign-in itself never matches by email.
+their existing user id — so anything keyed to it carries over.
 
 Input is the Entra user export: Entra admin center → Users → All users →
 Download users (CSV). Uses the object id column (`id` or `objectId`),
