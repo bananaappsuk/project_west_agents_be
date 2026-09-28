@@ -1,4 +1,7 @@
-"""RBAC administration. All routes require the `platform:admin` scope."""
+"""RBAC administration. All routes require the `platform:admin` scope.
+
+Members aren't added here: people and their roles come from Microsoft Entra ID
+(routers/entra.py)."""
 
 from __future__ import annotations
 
@@ -8,9 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
 from ..deps import require_platform_admin
-from ..models import Application, Membership, Permission, Role, User
-from ..schemas import ApplicationIn, MemberIn, PermissionIn, RoleIn
-from ..security import hash_password
+from ..models import Application, Permission, Role
+from ..schemas import ApplicationIn, PermissionIn, RoleIn
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_platform_admin)])
 
@@ -58,35 +60,3 @@ async def create_role(body: RoleIn, session: AsyncSession = Depends(get_session)
     await session.commit()
     return {"id": role.id, "name": role.name, "permissions": [p.key for p in perms]}
 
-
-@router.post("/members", status_code=status.HTTP_201_CREATED)
-async def add_member(body: MemberIn, session: AsyncSession = Depends(get_session)):
-    app = await session.scalar(select(Application).where(Application.key == body.app_key))
-    if not app:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "application not found")
-
-    user = await session.scalar(select(User).where(User.email == body.email))
-    if not user:
-        if not body.password:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "password required to create a new user")
-        user = User(email=body.email, password_hash=hash_password(body.password), full_name=body.full_name)
-        session.add(user)
-        await session.flush()
-
-    roles = list(
-        await session.scalars(
-            select(Role).where(Role.app_id == app.id, Role.name.in_(body.role_names))
-        )
-    )
-    membership = await session.scalar(
-        select(Membership).where(
-            Membership.user_id == user.id, Membership.org_id == body.org_id, Membership.app_id == app.id
-        )
-    )
-    if not membership:
-        membership = Membership(user_id=user.id, org_id=body.org_id, app_id=app.id, roles=roles)
-        session.add(membership)
-    else:
-        membership.roles = roles
-    await session.commit()
-    return {"membership_id": membership.id, "roles": [r.name for r in roles]}

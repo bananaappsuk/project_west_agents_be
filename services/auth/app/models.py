@@ -51,7 +51,12 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
     email: Mapped[str] = mapped_column(String, unique=True, index=True)
-    password_hash: Mapped[str] = mapped_column(String)
+    # Legacy: unused since sign-in moved to Microsoft Entra ID. Kept (nullable) so
+    # pre-Entra rows load; new rows leave it empty.
+    password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Entra object id (`oid`) — the only thing /auth/entra looks users up by.
+    entra_oid: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
+    entra_upn: Mapped[str | None] = mapped_column(String, nullable=True)
     full_name: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -102,32 +107,4 @@ class RefreshToken(Base):
     app_id: Mapped[str] = mapped_column(String)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class PasswordReset(Base):
-    """A pending self-serve password reset. Same one-time-token shape as
-    Invite: only the hash is stored, and it's single-use + time-limited."""
-
-    __tablename__ = "password_resets"
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    used: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class Invite(Base):
-    """A pending teammate invite. The raw token is shown once to the inviter; only
-    its hash is stored. Accepting it sets the user's password and activates them."""
-
-    __tablename__ = "invites"
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    org_id: Mapped[str] = mapped_column(String)
-    app_id: Mapped[str] = mapped_column(String)
-    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    accepted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -1,27 +1,22 @@
-"""One-time seed: create the single Organization + first admin User for a
+"""One-time seed: create the single Organization + the agent Applications for a
 uni-org deployment.
 
-Self-serve registration (`/auth/register`) and the platform-admin "sell one
-app to an org" endpoint (`/admin/provision`) have both been removed — this
-product now has exactly one organization, ever (see
+This product has exactly one organization, ever (see
 migrate_add_organizations_singleton.sql, which enforces that at the DB level
 too). This script is that org's only creation path, meant to run exactly once
-per deployment. Every additional user after this one is added via the normal
-"Users & Roles" invite flow (routers/orgs.py's POST /orgs/members +
-POST /auth/accept-invite) — not this script.
+per deployment.
 
-Grants the seeded admin an Owner membership in both "mail-agent" and
-"voice-agent" (mirrors what /auth/register used to do via AUTO_SUBSCRIBE_APPS
-before it was removed), reusing the same provisioning helper that endpoint
-used (routers/auth.py's `_provision_owner_membership`) so permissions/roles
-stay identical to what a normal owner would have gotten.
+No users are created here. People sign in with Microsoft Entra ID and are
+provisioned on first sign-in with the role from their Entra app role
+(routers/entra.py) — so the first administrator is whoever the Entra admin
+assigns Agents.Superadmin to.
 
 Refuses to run if an Organization already exists, rather than silently
 no-op'ing — a second run with different args should never be mistaken for
 having worked.
 
 Usage (from backend/services/auth with the venv active):
-    python -m scripts.seed_org --org-name "Acme" --email admin@acme.com --password "change-me-now" [--full-name "Ada Admin"]
+    python -m scripts.seed_org --org-name "Project West"
 """
 
 from __future__ import annotations
@@ -32,14 +27,13 @@ import asyncio
 from sqlalchemy import select
 
 from app.db import SessionLocal
-from app.models import Organization, User
-from app.routers.auth import _provision_owner_membership, _slug
-from app.security import hash_password
+from app.models import Application, Organization
+from app.routers.auth import _slug
 
 APPS = ["mail-agent", "voice-agent"]
 
 
-async def run(org_name: str, email: str, password: str, full_name: str | None) -> None:
+async def run(org_name: str) -> None:
     async with SessionLocal() as session:
         existing = await session.scalar(select(Organization))
         if existing:
@@ -49,26 +43,18 @@ async def run(org_name: str, email: str, password: str, full_name: str | None) -
             )
             return
 
-        user = User(email=email, password_hash=hash_password(password), full_name=full_name)
         org = Organization(name=org_name, slug=_slug(org_name))
-        session.add_all([user, org])
-        await session.flush()
-
+        session.add(org)
         for app_key in APPS:
-            await _provision_owner_membership(session, user=user, org=org, app_key=app_key)
+            if not await session.scalar(select(Application).where(Application.key == app_key)):
+                session.add(Application(key=app_key, name=app_key))
 
         await session.commit()
-        print(
-            f"Created organization {org.name!r} (id={org.id}) and admin user {user.email} "
-            f"(id={user.id}), owner of: {', '.join(APPS)}."
-        )
+        print(f"Created organization {org.name!r} (id={org.id}) with apps: {', '.join(APPS)}.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--org-name", required=True)
-    parser.add_argument("--email", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--full-name", default=None)
     args = parser.parse_args()
-    asyncio.run(run(args.org_name, args.email, args.password, args.full_name))
+    asyncio.run(run(args.org_name))

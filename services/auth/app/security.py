@@ -1,4 +1,4 @@
-"""Password hashing + token minting."""
+"""Token minting."""
 
 from __future__ import annotations
 
@@ -8,25 +8,9 @@ import time
 import uuid
 
 import jwt
-from argon2 import PasswordHasher
-from argon2.exceptions import Argon2Error
 
 from .config import settings
 from .keys import private_key
-
-_ph = PasswordHasher()
-
-
-def hash_password(password: str) -> str:
-    return _ph.hash(password)
-
-
-def verify_password(password_hash: str, password: str) -> bool:
-    try:
-        _ph.verify(password_hash, password)
-        return True
-    except Argon2Error:
-        return False
 
 
 def create_access_token(*, sub: str, typ: str, org: str | None, aud: str, roles: list[str], scope: str) -> str:

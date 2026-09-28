@@ -17,7 +17,7 @@ async def openid_configuration():
     return {
         "issuer": issuer,
         "jwks_uri": f"{issuer}/.well-known/jwks.json",
-        "token_endpoint": f"{issuer}/auth/login",
+        "token_endpoint": f"{issuer}/auth/entra",
         "id_token_signing_alg_values_supported": ["RS256"],
         # OAuth2 authorization_endpoint / grant types arrive in the SSO phase.
     }

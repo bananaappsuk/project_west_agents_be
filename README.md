@@ -20,8 +20,9 @@ Every application (mail-agent, voice-agent, Rekroot, Educare, …) shares these 
 - **Python 3.10+**, `pip` + `venv` + `requirements.txt` per service.
 - **No Docker, no local infra.** Databases are **Neon Postgres** (cloud),
   **one database per service** (`DATABASE_URL` in each service's `.env`).
-- **Auth**: email/password + RS256 JWT + JWKS + rotating refresh tokens (in Postgres).
-  OAuth2 (SSO / client-credentials) is a later phase.
+- **Auth**: Microsoft Entra ID sign-in (the frontend exchanges an Entra access token at
+  `POST /auth/entra`) + RS256 JWT + JWKS + rotating refresh tokens (in Postgres, 8-hour
+  sessions). Roles come from Entra app roles. There is no password login.
 
 ## Running a service (from the service directory)
 
