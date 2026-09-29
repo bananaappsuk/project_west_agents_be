@@ -30,7 +30,6 @@ ROUTES: list[tuple[str, str]] = sorted(
         ("/.well-known", settings.auth_url),
         ("/admin", settings.auth_url),
         ("/common", settings.auth_url),
-        ("/orgs", settings.auth_url),
         ("/emails", settings.mail_agent_url),
         ("/folders", settings.mail_agent_url),
         ("/alerts", settings.mail_agent_url),
