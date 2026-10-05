@@ -23,6 +23,9 @@ class EntraTokenError(Exception):
 
 _jwks_client: jwt.PyJWKClient | None = None
 
+# Entra backdates iat/nbf by 5 minutes for clock skew; the real issue time is iat + 300.
+_ENTRA_IAT_BACKDATE = 300
+
 
 def _authority() -> str:
     return f"https://login.microsoftonline.com/{settings.entra_tenant_id}"
@@ -58,7 +61,8 @@ def _verify(token: str) -> dict[str, Any]:
         raise EntraTokenError("token is from a different tenant")
     if settings.entra_scope not in str(claims["scp"]).split():
         raise EntraTokenError(f"token is missing the {settings.entra_scope} scope")
-    if claims["iat"] < time.time() - settings.entra_max_token_age:
+    # Measured from when Entra actually issued the token, not the backdated iat.
+    if claims["iat"] + _ENTRA_IAT_BACKDATE < time.time() - settings.entra_max_token_age:
         raise EntraTokenError("token is too old — sign in again")
     return claims
 
