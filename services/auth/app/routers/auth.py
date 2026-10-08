@@ -45,12 +45,14 @@ async def _issue_tokens(
     scope: str,
     expires_at: datetime | None = None,
     commit: bool = True,
+    groups: list[str] | None = None,
 ) -> TokenOut:
     """Mint an access + refresh token pair. `expires_at` pins the refresh token's
     expiry (a rotation passes its parent's, so the session never outlives
     REFRESH_TOKEN_TTL from sign-in); default is a fresh REFRESH_TOKEN_TTL."""
     access = create_access_token(
-        sub=user.id, typ="user", org=org_id, aud=app.key, roles=roles, scope=scope
+        sub=user.id, typ="user", org=org_id, aud=app.key, roles=roles, scope=scope,
+        groups=groups,
     )
     raw, token_hash = new_refresh_token()
     session.add(
@@ -104,8 +106,13 @@ async def refresh(body: RefreshIn, session: AsyncSession = Depends(get_session))
 
     rt.revoked = True  # rotate: single-use refresh tokens
     roles, scope = _token_fields(app.key, membership)
+    # Groups come from the user row, not the request: a refresh presents OUR
+    # refresh token, never Microsoft's, so there is no Entra token here to read a
+    # groups claim from. Omitting them would quietly strip every downstream
+    # service's view of what this person may access, 15 minutes after sign-in.
     return await _issue_tokens(
-        session, user=user, org_id=rt.org_id, app=app, roles=roles, scope=scope, expires_at=rt.expires_at
+        session, user=user, org_id=rt.org_id, app=app, roles=roles, scope=scope,
+        groups=list(user.entra_groups or []), expires_at=rt.expires_at
     )
 
 
