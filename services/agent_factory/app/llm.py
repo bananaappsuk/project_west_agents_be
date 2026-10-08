@@ -14,6 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .config import settings
+from . import taxonomy
 
 _PLACEHOLDER_KEYS = {"", "dummy", "sk-dummy", "changeme", "none", "null"}
 
@@ -97,7 +98,14 @@ class CrmFields(BaseModel):
 
 class MailAnalysis(CrmFields):
     summary: str = Field(description="One-line summary of what the email is asking for")
-    category: str = Field(description="One of: Billing, Support, Sales, Security, General")
+    category: taxonomy.Category = Field(
+        default="unclassified",
+        description="Exactly one controlled PW category code (see taxonomy.py / brief Reference 1)",
+    )
+    flags: list[str] = Field(
+        default_factory=list,
+        description="Cross-cutting flags that apply, from: " + ", ".join(taxonomy.FLAG_NAMES),
+    )
     priority: Literal["High", "Medium", "Low"]
     needs_reply: bool = Field(description="Whether this email warrants a reply to the sender")
     suggested_reply: str = Field(default="", description="A drafted reply if one is needed, else empty")
@@ -125,11 +133,22 @@ def _analyze_llm(email: dict) -> MailAnalysis:
     llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key)
     analyzer = llm.with_structured_output(MailAnalysis)
     system = (
-        "You triage inbound customer email for a family-services organisation. Produce a "
-        "one-line summary, a category (Billing, Support, Sales, Security, General), a "
-        "priority (High, Medium, Low), whether a reply to the sender is warranted, and — "
-        "if so — a short, professional suggested reply addressed to the sender by first "
-        "name. Set confidence 0-1.\n\n"
+        "You triage inbound email for Project West, a UK family-services organisation "
+        "(supervised family time, referrals, safeguarding). Produce a one-line summary, "
+        "a priority (High, Medium, Low), whether a reply to the sender is warranted, and "
+        "— if so — a short, professional suggested reply addressed to the sender by "
+        "first name. Set confidence 0-1.\n\n"
+        "Choose exactly one `category` from this controlled list, using the code:\n"
+        f"{taxonomy.prompt_category_list()}\n"
+        "Use `unclassified` when no category safely applies or two compete — that is a "
+        "correct answer, not a failure, and routes the item to staff for review.\n\n"
+        "Independently set `flags` to every cross-cutting flag that applies (an empty "
+        "list is fine). These do not replace the category:\n"
+        f"{taxonomy.prompt_flag_list()}\n"
+        "Set `safeguarding_indicator` whenever the message suggests a possible risk to a "
+        "child or vulnerable adult, even when another category is the primary one, and "
+        "even if you are unsure — a false positive there is reviewed by a person, "
+        "whereas a miss is not.\n\n"
         "Also classify `intent`, used to route this email to the CRM:\n"
         f"- REFERRAL: someone is asking to refer a family/child for a new service (not yet "
         f"an existing case). Fill referrer_name, referrer_type (one of: {_REFERRER_TYPES}), "
@@ -155,22 +174,14 @@ def _analyze_llm(email: dict) -> MailAnalysis:
 def _analyze_stub(email: dict) -> MailAnalysis:
     subject = (email.get("subject") or "").strip()
     body = (email.get("body") or "").strip()
-    text = f"{subject} {body}".lower()
+    text = f"{subject} {body}"
 
-    if any(w in text for w in ("password", "login", "verify", "suspicious", "security", "breach")):
-        category = "Security"
-    elif any(w in text for w in ("invoice", "payment", "billing", "refund", "charge")):
-        category = "Billing"
-    elif any(w in text for w in ("help", "issue", "problem", "error", "not working", "support")):
-        category = "Support"
-    elif any(w in text for w in ("demo", "pricing", "quote", "interested", "purchase")):
-        category = "Sales"
-    else:
-        category = "General"
+    case_ref = _find_case_ref(text)
+    category, flags = taxonomy.classify_stub(text, case_ref=case_ref)
 
-    if category == "Security" or any(w in text for w in ("urgent", "asap", "immediately", "critical", "emergency")):
+    if "urgent" in flags or taxonomy.is_safeguarding(category, flags):
         priority = "High"
-    elif "?" in body or "please" in text:
+    elif "?" in body or "please" in text.lower():
         priority = "Medium"
     else:
         priority = "Low"
@@ -179,15 +190,17 @@ def _analyze_stub(email: dict) -> MailAnalysis:
     summary = (first_line or "(no content)")[:160]
 
     first_name = (email.get("from") or "there").split()[0]
-    needs_reply = category != "General"
+    # A draft is wanted for most categories (a referral acknowledgement is
+    # explicitly required by §5.1); whether it may *send* is decided later by the
+    # guardrail. Only the no-draft-at-all cases are suppressed here.
+    needs_reply = not taxonomy.blocks_draft(category, flags)
     suggested = ""
     if needs_reply:
         suggested = (
-            f"Hi {first_name},\n\nThanks for reaching out regarding \"{subject}\". "
-            "We've received your message and will get back to you shortly.\n\n"
-            "Best regards,\nSupport Team"
+            f"Hi {first_name},\n\nThank you for your message regarding \"{subject}\". "
+            "We have received it and a member of the team will be in touch shortly.\n\n"
+            "Kind regards,\nProject West"
         )
-    case_ref = _find_case_ref(text)
     intent = _classify_intent_stub(text, case_ref)
     referrer_fields: dict = {}
     if intent == "REFERRAL":
@@ -197,7 +210,7 @@ def _analyze_stub(email: dict) -> MailAnalysis:
             "help_needed": (first_line or subject)[:300],
         }
     return MailAnalysis(
-        summary=summary, category=category, priority=priority,
+        summary=summary, category=category, flags=flags, priority=priority,
         needs_reply=needs_reply, suggested_reply=suggested, confidence=0.5,
         intent=intent, case_ref=case_ref, **referrer_fields,
     )
@@ -207,14 +220,20 @@ def _analyze_stub(email: dict) -> MailAnalysis:
 # Voice / call-recording analysis (voice-agent.call)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_CATEGORIES = ["Sales Enquiry", "Complaint", "Support", "Booking", "Billing", "General Enquiry"]
-
-
 class CallAnalysis(CrmFields):
     summary: str = Field(description="One-line summary of what the call was about")
-    category: Literal["Sales Enquiry", "Complaint", "Support", "Booking", "Billing", "General Enquiry"]
+    # Same controlled vocabulary as email (taxonomy.py) — PW classifies both channels
+    # into Reference 1 of the capability brief, not into channel-specific categories.
+    category: taxonomy.Category = Field(
+        default="unclassified",
+        description="Exactly one controlled PW category code (see taxonomy.py / brief Reference 1)",
+    )
+    flags: list[str] = Field(
+        default_factory=list,
+        description="Cross-cutting flags that apply, from: " + ", ".join(taxonomy.FLAG_NAMES),
+    )
     priority: Literal["High", "Medium", "Low"]
-    risk: Literal["High", "Medium", "Low"] = Field(description="Churn / escalation risk")
+    risk: Literal["High", "Medium", "Low"] = Field(description="Safeguarding / escalation risk")
     sentiment: Literal["Positive", "Neutral", "Negative"]
     needs_reply: bool = Field(description="Whether a follow-up reply to the customer is warranted")
     suggested_reply: str = Field(default="", description="A drafted reply if one is needed, else empty")
@@ -236,12 +255,25 @@ def _analyze_call_llm(call: dict) -> CallAnalysis:
     llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key)
     analyzer = llm.with_structured_output(CallAnalysis)
     system = (
-        "You triage recorded customer phone calls for a UK telecom support centre. "
-        f"Choose exactly one category from: {', '.join(_CATEGORIES)}. Give a one-line summary, "
-        "a priority (High/Medium/Low), a churn/escalation risk (High/Medium/Low), the customer "
-        "sentiment (Positive/Neutral/Negative), whether a follow-up reply is needed, and — if so — "
-        "a short, empathetic suggested reply addressed to the caller by first name. "
-        "Set confidence 0-1.\n\n"
+        "You triage recorded inbound phone calls for Project West, a UK family-services "
+        "organisation (supervised family time, referrals, safeguarding). Give a one-line "
+        "summary, a priority (High/Medium/Low), a safeguarding/escalation risk "
+        "(High/Medium/Low), the caller sentiment (Positive/Neutral/Negative), whether a "
+        "follow-up is needed, and — if so — a short, empathetic suggested reply addressed "
+        "to the caller by first name. Set confidence 0-1.\n\n"
+        "Choose exactly one `category` from this controlled list, using the code. It is "
+        "the same controlled vocabulary PW uses for email, so a call about a referral or "
+        "a safeguarding concern classifies identically to an email about one:\n"
+        f"{taxonomy.prompt_category_list()}\n"
+        "Use `unclassified` when no category safely applies or two compete — that is a "
+        "correct answer, not a failure, and routes the call to staff for review.\n\n"
+        "Independently set `flags` to every cross-cutting flag that applies (an empty "
+        "list is fine). These do not replace the category:\n"
+        f"{taxonomy.prompt_flag_list()}\n"
+        "Set `safeguarding_indicator` whenever the call suggests a possible risk to a "
+        "child or vulnerable adult, even when another category is the primary one, and "
+        "even if you are unsure — a false positive there is reviewed by a person, "
+        "whereas a miss is not.\n\n"
         "Also classify `intent`, used to route this call to the CRM:\n"
         f"- REFERRAL: caller is asking to refer a family/child for a new service (not an "
         f"existing case). Fill referrer_name, referrer_type (one of: {_REFERRER_TYPES}), "
@@ -266,62 +298,62 @@ def _analyze_call_llm(call: dict) -> CallAnalysis:
 
 
 def _analyze_call_stub(call: dict) -> CallAnalysis:
-    text = (call.get("transcript") or "").lower()
+    transcript = call.get("transcript") or ""
+    text = transcript.lower()
     caller = (call.get("caller") or "there").strip()
     first = caller.split()[0] if caller and caller != "Unknown Caller" else "there"
 
-    if any(w in text for w in ("cancel", "missed", "wasted", "nobody", "second time", "hasn't shown", "not shown")):
-        category = "Complaint"
-    elif any(w in text for w in ("charge", "invoice", "payment", "refund", "tariff", "increase", "billing")):
-        category = "Billing"
-    elif any(w in text for w in ("plan", "upgrade", "pricing", "sign up", "install", "fibre", "interested")):
-        category = "Sales Enquiry"
-    elif any(w in text for w in ("book", "slot", "reminder", "appointment", "engineer", "tuesday", "friday")):
-        category = "Booking"
-    elif any(w in text for w in ("router", "reset", "connection", "lights", "voicemail", "pin", "not working", "cuts out")):
-        category = "Support"
-    else:
-        category = "General Enquiry"
+    case_ref = _find_case_ref(transcript)
+    category, flags = taxonomy.classify_stub(transcript, case_ref=case_ref)
 
     resolved = any(w in text for w in ("thank", "brilliant", "perfect", "got it", "sorted", "worked", "understand", "helpful"))
-    negative = category == "Complaint" or any(w in text for w in ("angry", "wasted", "cancel", "affecting"))
+    negative = category in ("complaint", "safeguarding_concern") or any(
+        w in text for w in ("angry", "upset", "wasted", "unacceptable", "distressed")
+    )
     sentiment = "Negative" if negative and not resolved else ("Positive" if resolved and not negative else "Neutral")
 
-    if category == "Complaint":
+    # Risk here is safeguarding/escalation risk, not the template's churn risk —
+    # PW is a family-services charity, not a subscription business.
+    if taxonomy.is_safeguarding(category, flags):
         risk = "High"
-    elif category in ("Billing", "Booking") and not resolved:
+    elif category in ("complaint", "court_or_legal"):
+        risk = "High" if not resolved else "Medium"
+    elif category in ("scheduling_change", "payment_or_finance") and not resolved:
         risk = "Medium"
     else:
         risk = "Low"
 
-    priority = "High" if risk == "High" else ("Medium" if (not resolved and category != "General Enquiry") else "Low")
-    needs_reply = (not resolved) and category != "General Enquiry"
+    priority = "High" if (risk == "High" or "urgent" in flags) else (
+        "Medium" if (not resolved and category != "general_enquiry") else "Low"
+    )
+    needs_reply = (
+        (not resolved)
+        and category != "general_enquiry"
+        and not taxonomy.blocks_draft(category, flags)
+    )
 
-    summary_map = {
-        "Complaint": "Customer raised a complaint and may be at risk of leaving.",
-        "Billing": "Customer had a billing query that needs following up.",
-        "Sales Enquiry": "Prospective customer enquired about products or upgrades.",
-        "Booking": "Customer discussed an installation or appointment booking.",
-        "Support": "Customer reported a technical issue.",
-        "General Enquiry": "General enquiry, resolved on the call.",
-    }
+    summary = f"Call classified as {taxonomy.CATEGORY_LABELS[category].lower()}."
+    first_line = next((ln.strip() for ln in transcript.split("\n") if ln.strip()), "")
+    if first_line:
+        summary = f"{summary} Opened: {first_line[:120]}"
+
     suggested = ""
     if needs_reply:
         suggested = (
-            f"Hi {first}, thanks for your call. I've noted everything we discussed and will make sure "
-            "it's followed up promptly. If there's anything else you need in the meantime, just let us know."
+            f"Hi {first}, thank you for your call. I have noted everything we discussed and "
+            "will make sure it is followed up promptly. If there is anything else you need "
+            "in the meantime, please let us know."
         )
-    case_ref = _find_case_ref(text)
-    intent = _classify_intent_stub(text, case_ref)
+    intent = _classify_intent_stub(transcript, case_ref)
     referrer_fields: dict = {}
     if intent == "REFERRAL":
         referrer_fields = {
             "referrer_name": caller if caller and caller != "Unknown Caller" else "",
             "referrer_type": "SELF",
-            "help_needed": summary_map[category],
+            "help_needed": (first_line or summary)[:300],
         }
     return CallAnalysis(
-        summary=summary_map[category], category=category, priority=priority, risk=risk,
+        summary=summary, category=category, flags=flags, priority=priority, risk=risk,
         sentiment=sentiment, needs_reply=needs_reply, suggested_reply=suggested, confidence=0.5,
         intent=intent, case_ref=case_ref, **referrer_fields,
     )
