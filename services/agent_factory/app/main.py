@@ -68,4 +68,10 @@ async def invoke(
         "analysis": result.get("analysis"),
         "escalate": result.get("escalate"),
         "auto_sendable": result.get("auto_sendable"),
+        # Routing is decided here, next to the taxonomy that defines it, and the
+        # app service only persists the outcome — that way the controlled
+        # vocabulary and its routing table have exactly one home rather than a
+        # vendored copy per service that can drift out of step with the brief.
+        "route": result.get("route"),
+        "restricted": result.get("restricted"),
     }
