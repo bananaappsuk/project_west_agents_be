@@ -50,6 +50,8 @@ def serialize_recording(r: Recording) -> dict:
         "date": r.call_date,
         "duration": r.duration,
         "category": r.category,
+        "flags": list(r.flags or []),
+        "route": r.route or "",
         "priority": r.priority,
         "risk": r.risk,
         "sentiment": r.sentiment,
