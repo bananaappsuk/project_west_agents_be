@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     DateTime,
     Integer,
@@ -11,6 +12,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -26,7 +28,6 @@ def _id() -> str:
 class Recording(Base):
     __tablename__ = "recordings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    org_id: Mapped[str] = mapped_column(String, index=True)
     ext_id: Mapped[str] = mapped_column(String)  # BT Cloud recording id / S3 object key — dedup key within an org
     # Which connector this specific recording came from — "bt_cloud" | "s3". Recorded
     # at fetch time (not read from the org's *current* settings) so playback knows
@@ -50,8 +51,20 @@ class Recording(Base):
     content_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     # AI fields (filled by the Agent Factory voice agent)
     summary: Mapped[str] = mapped_column(Text, default="")
-    category: Mapped[str] = mapped_column(String, default="General Enquiry")
+    # One code from the controlled PW taxonomy (agent_factory/app/taxonomy.py,
+    # mirroring Reference 1 of the capability brief) — the same vocabulary email
+    # uses, so a call about a referral classifies identically to an email about one.
+    category: Mapped[str] = mapped_column(String, default="unclassified")
+    # Cross-cutting flags from the same taxonomy — a separate axis from `category`.
+    flags: Mapped[list[str]] = mapped_column(
+        ARRAY(String), default=list, server_default=text("'{}'::varchar[]")
+    )
+    # The queue this call was routed to (taxonomy.Queue). Stored, not derived on
+    # read, so re-tuning the routing table cannot rewrite where past items went.
+    route: Mapped[str] = mapped_column(String, default="", server_default="")
     priority: Mapped[str] = mapped_column(String, default="Medium")     # High | Medium | Low
+    # Safeguarding / escalation risk — not the churn risk of the template this
+    # service started from; PW is a charity, not a subscription business.
     risk: Mapped[str] = mapped_column(String, default="Low")            # High | Medium | Low
     sentiment: Mapped[str] = mapped_column(String, default="Neutral")   # Positive | Neutral | Negative
     needs_reply: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -73,13 +86,14 @@ class Recording(Base):
     # new = latest cron extraction; old = swept by a later run
     status: Mapped[str] = mapped_column(String, default="new", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (UniqueConstraint("org_id", "ext_id", name="uq_recording_org_ext"),)
+    __table_args__ = (UniqueConstraint("ext_id", name="uq_recording_ext"),)
 
 
 class VoiceSettings(Base):
+    """Voice agent settings. One row, enforced by `ux_voice_settings_singleton` —
+    the old org_id column's UNIQUE constraint used to provide that implicitly."""
     __tablename__ = "voice_settings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    org_id: Mapped[str] = mapped_column(String, unique=True, index=True)
     # Which connector fetch_and_process() dispatches to — "bt_cloud" | "s3". Both field sets
     # below persist regardless of which is active, so switching doesn't discard the other.
     source_type: Mapped[str] = mapped_column(String, default="bt_cloud")
@@ -105,7 +119,6 @@ class VoiceSettings(Base):
 class Notification(Base):
     __tablename__ = "voice_notifications"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    org_id: Mapped[str] = mapped_column(String, index=True)
     text: Mapped[str] = mapped_column(Text, default="")
     read: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -114,7 +127,6 @@ class Notification(Base):
 class AgentRun(Base):
     __tablename__ = "voice_agent_runs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    org_id: Mapped[str] = mapped_column(String, index=True)
     run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     fetched: Mapped[int] = mapped_column(Integer, default=0)
     processed: Mapped[int] = mapped_column(Integer, default=0)
