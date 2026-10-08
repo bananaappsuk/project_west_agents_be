@@ -26,7 +26,15 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, crm_sync, crypto, graph_client, mail_client, sendgrid_client
+from . import (
+    agent_client,
+    crm_sync,
+    crypto,
+    graph_client,
+    mail_client,
+    restriction,
+    sendgrid_client,
+)
 from .config import settings
 from .db import SessionLocal
 from .models import AgentConfig, AgentRun, Email, Mailbox
@@ -55,7 +63,7 @@ def _send_fn_for(provider: str):
 # the two can never race on the same org's rows. Only valid because this service
 # runs as a single process (see run-all.ps1 — no --workers); the scheduler's own
 # tick-pileup guard defers to this same set.
-_running: set[str] = set()
+_running = False
 
 # In-memory guard against two concurrent analyze attempts for the *same email* —
 # a manual retry-summary click racing the sync's own post-fetch auto-analyze (or
@@ -106,17 +114,17 @@ _BACKLOG_ANALYZE_DEFAULT = 100
 _ANALYZE_CONCURRENCY = 5
 
 
-def is_running(org_id: str) -> bool:
-    return org_id in _running
+def is_running() -> bool:
+    return _running
 
 
-async def load_send_context(org_id: str) -> tuple[dict, str, bool] | None:
+async def load_send_context() -> tuple[dict, str, bool] | None:
     """Send creds (shape depends on provider — Graph reuses its read creds,
     IMAP orgs get SMTP creds) + the org's auto-reply setting — everything an
     analysis pass needs besides the emails themselves. Returns None if no
     mailbox is set up."""
     async with SessionLocal() as s:
-        mailbox = await s.scalar(select(Mailbox).where(Mailbox.org_id == org_id))
+        mailbox = await s.scalar(select(Mailbox))
         if not mailbox:
             return None
         if mailbox.provider == "graph":
@@ -133,11 +141,11 @@ async def load_send_context(org_id: str) -> tuple[dict, str, bool] | None:
                 "username": mailbox.username,
                 "password": crypto.decrypt(mailbox.password_enc),
             }
-        cfg = await s.scalar(select(AgentConfig).where(AgentConfig.org_id == org_id))
+        cfg = await s.scalar(select(AgentConfig))
         return send_creds, mailbox.provider, bool(cfg and cfg.auto_reply_enabled)
 
 
-async def _select_for_analysis(org_id: str, limit: int) -> list[tuple[str, dict]]:
+async def _select_for_analysis(limit: int) -> list[tuple[str, dict]]:
     """Picks the most recent `limit` emails eligible for analysis — freshly
     "skipped" ones first in effect, since ordering is by received date, but a
     stuck "pending" row from an interrupted earlier pass is just as eligible
@@ -151,7 +159,6 @@ async def _select_for_analysis(org_id: str, limit: int) -> list[tuple[str, dict]
         rows = list(await s.scalars(
             select(Email)
             .where(
-                Email.org_id == org_id,
                 or_(
                     Email.summary_status == "skipped",
                     and_(Email.summary_status == "pending", Email.created_at < stale_cutoff),
@@ -166,14 +173,14 @@ async def _select_for_analysis(org_id: str, limit: int) -> list[tuple[str, dict]
         return [(e.id, serialize_email(e)) for e in rows]
 
 
-async def _count_skipped(org_id: str) -> int:
+async def _count_skipped() -> int:
     async with SessionLocal() as s:
-        rows = await s.scalars(select(Email.id).where(Email.org_id == org_id, Email.summary_status == "skipped"))
+        rows = await s.scalars(select(Email.id).where(Email.summary_status == "skipped"))
         return len(list(rows))
 
 
 async def analyze_and_persist(
-    org_id: str, rows: list[tuple[str, dict]], *, auto_reply_enabled: bool, send_creds: dict, provider: str,
+    rows: list[tuple[str, dict]], *, auto_reply_enabled: bool, send_creds: dict, provider: str,
     sem: asyncio.Semaphore | None = None, attachments_by_id: dict[str, list[dict]] | None = None,
 ) -> tuple[int, int, bool]:
     """Analyzes + persists a batch of (email_id, payload) pairs — the shared
@@ -205,7 +212,15 @@ async def analyze_and_persist(
                 try:
                     res = await agent_client.analyze_email(payload)
                     a = res.get("analysis") or {}
-                    log.info("analyzed uid=%s -> %s/%s", payload.get("uid"), a.get("category"), a.get("priority"))
+                    # Carried alongside the analysis rather than recomputed here —
+                    # the agent owns the taxonomy and its routing table.
+                    a["route"] = res.get("route") or ""
+                    a["restricted"] = bool(res.get("restricted"))
+                    log.info(
+                        "analyzed uid=%s -> %s/%s route=%s%s",
+                        payload.get("uid"), a.get("category"), a.get("priority"),
+                        a["route"], " RESTRICTED" if a["restricted"] else "",
+                    )
                     return email_id, a, bool(res.get("auto_sendable")), True
                 except Exception as exc:
                     log.warning("analysis FAILED uid=%s: %s", payload.get("uid"), exc)
@@ -221,8 +236,29 @@ async def analyze_and_persist(
         payload_by_id = {eid: p for eid, p in rows}
         send_fn = _send_fn_for(provider)
 
+        # Which of this batch are already restricted from the address they ARRIVED
+        # at. Read once, outside the send loop, so no DB connection is held across a
+        # network call.
+        async with SessionLocal() as s:
+            restricted_ids = set(
+                (await s.scalars(
+                    select(Email.id).where(
+                        Email.id.in_([eid for eid, _ in rows]),
+                        Email.restricted.is_(True),
+                    )
+                )).all()
+            )
+
         async def maybe_send(email_id: str, a: dict, auto_sendable: bool, ok: bool) -> tuple[str, dict, bool, bool]:
             if not (ok and auto_reply_enabled and auto_sendable and a.get("needs_reply")):
+                return email_id, a, ok, False
+            # No autonomous substantive reply to safeguarding material, whichever
+            # signal raised it: the arrival address (restricted_ids) or the
+            # classifier (the flag on this result). A cleared human may still reply
+            # by hand -- the bar is on the agent acting by itself, because nobody
+            # with clearance has necessarily seen the item yet.
+            if email_id in restricted_ids or restriction.FLAG_SAFEGUARDING in (a.get("flags") or []):
+                log.info("auto-send withheld (restricted) email_id=%s", email_id)
                 return email_id, a, ok, False
             payload = payload_by_id[email_id]
             async with sem:
@@ -265,7 +301,20 @@ async def analyze_and_persist(
                     continue
                 if ok:
                     e.summary = a.get("summary", "")
-                    e.category = a.get("category", "")
+                    e.category = a.get("category", "") or "unclassified"
+                    # Merge rather than assign. Ingestion may already have marked
+                    # this row restricted from the address it ARRIVED at, and a
+                    # plain assignment here would let the classifier silently undo
+                    # that -- a message sent to safeguarding@ and classified as a
+                    # routine enquiry would land in an open queue. Restriction only
+                    # ratchets up; see restriction.py.
+                    e.route, e.restricted, e.flags = restriction.apply_classification(
+                        current_route=e.route,
+                        current_restricted=bool(e.restricted),
+                        alias_restricted=bool(e.restricted),
+                        model_route=a.get("route"),
+                        model_flags=list(a.get("flags") or []),
+                    )
                     e.priority = a.get("priority", "Medium")
                     e.confidence = a.get("confidence", 0.0)
                     e.needs_reply = bool(a.get("needs_reply", False))
@@ -299,7 +348,7 @@ async def analyze_and_persist(
         _analyzing.difference_update(claimed)
 
 
-async def analyze_backlog(org_id: str, count: int = _BACKLOG_ANALYZE_DEFAULT) -> dict:
+async def analyze_backlog(count: int = _BACKLOG_ANALYZE_DEFAULT) -> dict:
     """Manually analyzes the next `count` not-yet-analyzed emails (most recent
     first among what's still "skipped") — Settings' "Summarize previous 100",
     repeatable to work through a backlog at the org's own pace/cost, and usable
@@ -307,28 +356,29 @@ async def analyze_backlog(org_id: str, count: int = _BACKLOG_ANALYZE_DEFAULT) ->
 
     Raises RuntimeError if a sync or another analyze pass is already running for
     this org, LookupError if no mailbox is configured yet."""
-    if org_id in _running:
-        raise RuntimeError(f"a sync/analyze is already in progress for org={org_id}")
-    _running.add(org_id)
+    global _running
+    if _running:
+        raise RuntimeError("a sync/analyze is already in progress")
+    _running = True
     try:
-        ctx = await load_send_context(org_id)
+        ctx = await load_send_context()
         if ctx is None:
             raise LookupError("no mailbox configured for this org")
         send_creds, provider, auto_reply_enabled = ctx
 
-        rows = await _select_for_analysis(org_id, count)
+        rows = await _select_for_analysis(count)
         ok, high, all_ok = await analyze_and_persist(
-            org_id, rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider,
+            rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider,
         )
-        remaining = await _count_skipped(org_id)
-        log.info("analyze_backlog: org=%s analyzed=%d high=%d remaining=%d all_ok=%s", org_id, ok, high, remaining, all_ok)
+        remaining = await _count_skipped()
+        log.info("analyze_backlog: analyzed=%d high=%d remaining=%d all_ok=%s", ok, high, remaining, all_ok)
         return {"analyzed": ok, "highPriority": high, "remaining": remaining, "allOk": all_ok}
     finally:
-        _running.discard(org_id)
+        _running = False
 
 
 async def fetch_and_process(
-    org_id: str, count: int = 0, *, sweep: bool = True, reset_watermark: bool = False,
+    count: int = 0, *, sweep: bool = True, reset_watermark: bool = False,
 ) -> list[str]:
     """Returns the ids of newly-fetched emails.
 
@@ -353,21 +403,22 @@ async def fetch_and_process(
     progress counters update after every batch, so any page can poll GET
     /agent/status to see live progress, regardless of which page issued the
     request or whether that page is even still mounted."""
-    if org_id in _running:
-        raise RuntimeError(f"a sync is already in progress for org={org_id}")
-    _running.add(org_id)
+    global _running
+    if _running:
+        raise RuntimeError("a sync is already in progress")
+    _running = True
 
     async with SessionLocal() as s:
-        run = AgentRun(org_id=org_id, status="running")
+        run = AgentRun(status="running")
         s.add(run)
         await s.commit()
         run_id = run.id
-    log.info("fetch start: org=%s count=%d sweep=%s reset_watermark=%s run=%s", org_id, count, sweep, reset_watermark, run_id)
+    log.info("fetch start: count=%d sweep=%s reset_watermark=%s run=%s", count, sweep, reset_watermark, run_id)
 
     try:
-        return await _run(org_id, count, sweep, reset_watermark, run_id)
+        return await _run(count, sweep, reset_watermark, run_id)
     except Exception as exc:
-        log.exception("fetch FAILED: org=%s run=%s", org_id, run_id)
+        log.exception("fetch FAILED: run=%s", run_id)
         async with SessionLocal() as s:
             r = await s.get(AgentRun, run_id)
             if r:
@@ -376,10 +427,10 @@ async def fetch_and_process(
                 await s.commit()
         raise
     finally:
-        _running.discard(org_id)
+        _running = False
 
 
-async def _known_uids(org_id: str, uid_validity: str | None) -> set[str]:
+async def _known_uids(uid_validity: str | None) -> set[str]:
     """UIDs already stored for this org, scoped to the *current* UID epoch
     (`uid_validity`) plus any legacy rows that pre-date the uid_validity column
     (NULL — those never had an epoch recorded, so they're included unconditionally
@@ -391,18 +442,17 @@ async def _known_uids(org_id: str, uid_validity: str | None) -> set[str]:
     async with SessionLocal() as s:
         return set(await s.scalars(
             select(Email.uid).where(
-                Email.org_id == org_id,
                 or_(Email.uid_validity == uid_validity, Email.uid_validity.is_(None)),
             )
         ))
 
 
-async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_id: str) -> list[str]:
+async def _run(count: int, sweep: bool, reset_watermark: bool, run_id: str) -> list[str]:
     # 1) short txn: read mailbox creds + org config + the sync watermark
     async with SessionLocal() as s:
-        mailbox = await s.scalar(select(Mailbox).where(Mailbox.org_id == org_id))
+        mailbox = await s.scalar(select(Mailbox))
         if not mailbox or not mailbox.enabled:
-            log.warning("fetch aborted: org=%s has no enabled mailbox", org_id)
+            log.warning("fetch aborted: no enabled mailbox")
             raise LookupError("no mailbox configured for this org")
         mailbox_id = mailbox.id
         sync_epoch = mailbox.sync_epoch
@@ -431,7 +481,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
             "username": mailbox.username,
             "password": crypto.decrypt(mailbox.password_enc),
         }
-        cfg = await s.scalar(select(AgentConfig).where(AgentConfig.org_id == org_id))
+        cfg = await s.scalar(select(AgentConfig))
         auto_reply_enabled = bool(cfg and cfg.auto_reply_enabled)
 
         since_uid = None if reset_watermark else mailbox.last_synced_uid
@@ -467,7 +517,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
     while True:
         batch_num += 1
         batch_cap = min(count, _BATCH_SIZE) if count else _BATCH_SIZE
-        known_uids = await _known_uids(org_id, current_uid_validity)
+        known_uids = await _known_uids(current_uid_validity)
 
         if provider == "graph":
             messages, watermark_advance = await run_in_threadpool(
@@ -499,10 +549,10 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                 # the update), and restart the loop to refetch (and re-dedup)
                 # cleanly against the newly-adopted epoch.
                 log.warning(
-                    "org=%s: sync epoch is now %s (was %s) — (re)establishing the sync "
+                    "sync epoch is now %s (was %s) — (re)establishing the sync "
                     "epoch and resetting the watermark so a stored UID under this epoch is "
                     "never mistaken for a new message, nor a new message silently dropped",
-                    org_id, namespaced_uid_validity, current_uid_validity,
+                    namespaced_uid_validity, current_uid_validity,
                 )
                 current_uid_validity = namespaced_uid_validity
                 since_uid = None
@@ -513,7 +563,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                         mb.last_synced_uid = None
                     await s.commit()
                 continue
-        log.info("org=%s batch=%d: pulled %d message(s)", org_id, batch_num, len(messages))
+        log.info("batch=%d: pulled %d message(s)", batch_num, len(messages))
         if not messages:
             break
 
@@ -534,7 +584,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                 # every sweep. This flips the flags in the DB directly.
                 result = await s.execute(
                     sa_update(Email)
-                    .where(Email.org_id == org_id, Email.archived_at.is_(None))
+                    .where(Email.archived_at.is_(None))
                     .values(archived_at=now, archived_by="cron")
                 )
                 total_archived = max(result.rowcount, 0)
@@ -550,7 +600,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                     # iframe — defense in depth against a malicious sender's HTML.
                     body = nh3.clean(body)
                 row = Email(
-                    org_id=org_id, uid=m["uid"], uid_validity=current_uid_validity,
+                    uid=m["uid"], uid_validity=current_uid_validity,
                     sender=m["from"], from_email=m["fromEmail"],
                     subject=m["subject"], body=body, content_type=content_type,
                     received_at=m["receivedAt"], summary_status="skipped",
@@ -582,7 +632,7 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
                 run.processed += len(new)
                 run.archived = total_archived
             await s.commit()
-        log.info("org=%s batch=%d: %d new email(s) after dedup", org_id, batch_num, len(new))
+        log.info("batch=%d: %d new email(s) after dedup", batch_num, len(new))
 
         total_fetched += len(messages)
         total_processed += len(new)
@@ -592,17 +642,17 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
             break
         if total_processed >= _MAX_PER_RUN:
             log.info(
-                "org=%s hit the per-run import ceiling (%d) — remaining backlog continues on the next run",
-                org_id, _MAX_PER_RUN,
+                "hit the per-run import ceiling (%d) — remaining backlog continues on the next run",
+                _MAX_PER_RUN,
             )
             break
         if len(messages) < batch_cap:
             break  # the mailbox had fewer than a full batch left — caught up
 
     # --- analysis phase: summarize only the most recent slice, once, after import ---
-    rows = await _select_for_analysis(org_id, _AUTO_ANALYZE_COUNT)
+    rows = await _select_for_analysis(_AUTO_ANALYZE_COUNT)
     _, high, all_ok = await analyze_and_persist(
-        org_id, rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider, sem=sem,
+        rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider, sem=sem,
         attachments_by_id=attachments_by_id,
     )
 
@@ -613,8 +663,8 @@ async def _run(org_id: str, count: int, sweep: bool, reset_watermark: bool, run_
             run.status = "success" if all_ok else "partial"
         await s.commit()
     log.info(
-        "run recorded: org=%s fetched=%d imported=%d analyzed=%d high=%d archived=%d run=%s",
-        org_id, total_fetched, total_processed, len(rows), high, total_archived, run_id,
+        "run recorded: fetched=%d imported=%d analyzed=%d high=%d archived=%d run=%s",
+        total_fetched, total_processed, len(rows), high, total_archived, run_id,
     )
 
     return all_new_ids
