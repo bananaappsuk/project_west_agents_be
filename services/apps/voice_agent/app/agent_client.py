@@ -8,8 +8,8 @@ from .config import settings
 
 
 async def analyze_call(call_payload: dict) -> dict:
-    """Return {"analysis": {summary, category, priority, risk, sentiment, needs_reply,
-    suggested_reply, confidence}, "escalate": bool}.
+    """Return {"analysis": {summary, category, flags, route, restricted, priority, risk,
+    sentiment, needs_reply, suggested_reply, confidence}, "escalate": bool}.
 
     The factory's generic invoke wraps the payload under the "email" input slot; the
     voice agent's graph reads that slot as the call record.
@@ -21,4 +21,13 @@ async def analyze_call(call_payload: dict) -> dict:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(url, json={"email": call_payload}, headers=headers)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+    # The factory returns routing beside the analysis, not inside it. Folding it in
+    # here means the three call sites that persist a recording all see it without
+    # each having to remember to read it off the envelope — and routing stays owned
+    # by the agent, which is where the taxonomy lives.
+    analysis = data.get("analysis")
+    if isinstance(analysis, dict):
+        analysis["route"] = data.get("route") or ""
+        analysis["restricted"] = bool(data.get("restricted"))
+    return data
