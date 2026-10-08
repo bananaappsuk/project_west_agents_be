@@ -34,5 +34,28 @@ class Settings(BaseServiceSettings):
     # did), which must be a Single Sender verified in the SendGrid dashboard.
     sendgrid_api_key: str | None = None
 
+    # ── Microsoft Graph, app-only (Project West) ─────────────────────────────
+    # ONE app registration serves all six shared mailboxes, so these live in
+    # deployment configuration rather than per-mailbox database rows. That takes the
+    # application out of the business of storing credentials entirely — a meaningful
+    # reduction in what a database compromise would yield, and the reason crypto.py
+    # can go once the IMAP path is retired.
+    #
+    # Authorization is NOT granted here. The service principal holds no Microsoft
+    # Graph application permissions at all; its access comes from Exchange RBAC for
+    # Applications, scoped to exactly the six mailboxes. That is deliberate and must
+    # stay that way: Entra and Exchange RBAC permissions are a UNION, so adding a
+    # tenant-wide Graph grant here would override the management scope and expose
+    # every personal mailbox in the tenant. The fix for "the agent cannot read" is
+    # never to grant it Mail.Read in Entra.
+    graph_tenant_id: str | None = None
+    graph_client_id: str | None = None
+    graph_client_secret: str | None = None
+
+    @property
+    def graph_configured(self) -> bool:
+        return bool(self.graph_tenant_id and self.graph_client_id
+                    and self.graph_client_secret)
+
 
 settings = Settings()
