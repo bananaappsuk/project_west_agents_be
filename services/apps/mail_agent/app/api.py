@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from . import crypto, graph_client, mail_client, pipeline
 from .config import settings
 from .db import get_session
-from .deps import require
+from .deps import mailbox_scope, require
+from .mailbox_scope import MailboxScope
 from .models import AgentConfig, AgentRun, Email, Folder, Mailbox
 from .scheduler import _interval_minutes
 from .schemas import (
@@ -23,6 +24,7 @@ from .schemas import (
     ReplyIn,
     serialize_email,
     serialize_folder,
+    serialize_mailbox,
 )
 
 router = APIRouter()
@@ -31,15 +33,46 @@ READ = f"{settings.app_key}:emails.read"
 WRITE = f"{settings.app_key}:emails.write"
 
 
-def _org(claims: dict) -> str:
-    return claims["org"]
+async def _get_email(session: AsyncSession, email_id: str, scope: MailboxScope) -> Email:
+    """Fetch one email, scoped to the mailboxes this user may read.
 
+    The mailbox filter is part of the query rather than a check applied to the
+    result. An out-of-scope row therefore comes back as "not found" -- the same 404
+    a non-existent id produces, deliberately. A 403 would confirm the email exists
+    and that somebody else can see it, and for a system holding safeguarding
+    material that inference is itself a leak.
 
-async def _get_email(session: AsyncSession, org: str, email_id: str) -> Email:
-    e = await session.scalar(select(Email).where(Email.org_id == org, Email.id == email_id))
+    Restricted rows are excluded unless the user holds safeguarding clearance, for
+    the same reason: absent, not redacted.
+    """
+    stmt = select(Email).where(
+        Email.id == email_id,
+        Email.mailbox_id.in_(scope.readable),
+    )
+    if not scope.safeguarding:
+        stmt = stmt.where(Email.restricted.is_(False))
+    e = await session.scalar(stmt)
     if not e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "email not found")
     return e
+
+
+async def _scoped_emails(session: AsyncSession, ids: list[str], scope: MailboxScope):
+    """The subset of `ids` this user may actually act on.
+
+    A bulk action takes ids straight from the client, so an unfiltered
+    `Email.id.in_(ids)` lets anyone act on any email in the system just by knowing
+    its id. Out-of-scope ids are silently skipped rather than rejected: refusing the
+    whole batch would tell the caller which ids exist in mailboxes they cannot see,
+    and acting on them would be worse still.
+    """
+    stmt = select(Email).where(
+        Email.id.in_(ids),
+        Email.mailbox_id.in_(scope.readable),
+    )
+    if not scope.safeguarding:
+        stmt = stmt.where(Email.restricted.is_(False))
+    return list(await session.scalars(stmt))
 
 
 # ---------- health ----------
@@ -48,12 +81,70 @@ async def health():
     return {"status": "ok", "service": "mail_agent"}
 
 
+# ---------- mailboxes ----------
+@router.get("/mailboxes")
+async def list_mailboxes(
+    claims: dict = Depends(require(READ)),
+    scope: MailboxScope = Depends(mailbox_scope),
+    session: AsyncSession = Depends(get_session),
+):
+    """The shared mailboxes this user may act on, with their rights on each.
+
+    Returned per user rather than as a fixed list: two people signing in see
+    different sets, and the UI must not offer a mailbox the API would then refuse.
+    Legacy and invisible mailboxes never appear -- pre-PW POC data is not part of
+    the Project West workspace.
+    """
+    if scope.is_empty:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "you are not authorised for any mailbox - ask IT to add you to the "
+            "relevant PW-Mailbox group",
+        )
+    rows = (await session.execute(
+        select(Mailbox)
+        .where(Mailbox.id.in_(scope.readable), Mailbox.visible.is_(True))
+        .order_by(Mailbox.display_name)
+    )).scalars().all()
+    return [
+        serialize_mailbox(
+            m,
+            can_read=True,
+            can_send=m.id in scope.sendable,
+            can_approve=m.id in scope.approvable,
+        )
+        for m in rows
+    ]
+
+
 # ---------- emails ----------
 @router.get("/emails")
-async def list_emails(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    rows = await session.scalars(
-        select(Email).where(Email.org_id == _org(claims)).order_by(Email.received_at.desc())
+async def list_emails(
+    mailboxId: str | None = None,
+    claims: dict = Depends(require(READ)),
+    scope: MailboxScope = Depends(mailbox_scope),
+    session: AsyncSession = Depends(get_session),
+):
+    if scope.is_empty:
+        # Explicit, not an empty list. A user authorised for nothing must see an
+        # error they can act on, not an inbox that reads as "no mail today".
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "you are not authorised for any mailbox - ask IT to add you to the "
+            "relevant PW-Mailbox group",
+        )
+    # `mailboxId` can only ever NARROW the authorised set -- scope.narrow() returns
+    # an intersection, never the request itself. A crafted id for a mailbox the user
+    # cannot read yields an empty result rather than widening their view.
+    stmt = select(Email).where(
+        Email.mailbox_id.in_(scope.narrow([mailboxId] if mailboxId else None))
     )
+    if not scope.safeguarding:
+        # Restricted items are absent from the list, the counts and the search --
+        # not shown as a redacted placeholder. A visible "hidden item" marker would
+        # itself disclose that a safeguarding matter exists for a family.
+        stmt = stmt.where(Email.restricted.is_(False))
+    rows = await session.scalars(stmt.order_by(Email.received_at.desc()))
     return [serialize_email(e) for e in rows]
 
 
@@ -62,6 +153,7 @@ async def fetch_emails(
     background_tasks: BackgroundTasks,
     count: int = 0,
     full_resync: bool = False,
+    scope: MailboxScope = Depends(mailbox_scope),
     claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)
 ):
     """Kicks off a fetch+analyze run in the background and returns immediately —
@@ -79,21 +171,20 @@ async def fetch_emails(
     watermark), not a fixed per-run cap. `full_resync=True` ignores the stored
     watermark and rescans the whole mailbox from the start — a recovery/audit
     tool, not something a normal sync needs."""
-    org = _org(claims)
-    mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == org))
+    mailbox = await session.scalar(select(Mailbox))
     if not mailbox or not mailbox.enabled:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured for this org")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
 
-    if pipeline.is_running(org):
+    if pipeline.is_running():
         raise HTTPException(status.HTTP_409_CONFLICT, "a sync is already in progress")
 
-    background_tasks.add_task(pipeline.fetch_and_process, org, count, sweep=True, reset_watermark=full_resync)
+    background_tasks.add_task(pipeline.fetch_and_process, count, sweep=True, reset_watermark=full_resync)
     return {"status": "started"}
 
 
 @router.post("/emails/move", status_code=status.HTTP_204_NO_CONTENT)
-async def move_to_folder(body: MoveIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    rows = await session.scalars(select(Email).where(Email.org_id == _org(claims), Email.id.in_(body.ids)))
+async def move_to_folder(body: MoveIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
+    rows = await _scoped_emails(session, body.ids, scope)
     for e in rows:
         e.folder_id = body.folderId
     await session.commit()
@@ -101,9 +192,9 @@ async def move_to_folder(body: MoveIn, claims: dict = Depends(require(WRITE)), s
 
 
 @router.post("/emails/archive", status_code=status.HTTP_204_NO_CONTENT)
-async def archive_emails(body: IdsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
+async def archive_emails(body: IdsIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
     now = datetime.now(timezone.utc)
-    rows = await session.scalars(select(Email).where(Email.org_id == _org(claims), Email.id.in_(body.ids)))
+    rows = await _scoped_emails(session, body.ids, scope)
     for e in rows:
         e.archived_at = now
         e.archived_by = "user"
@@ -112,8 +203,8 @@ async def archive_emails(body: IdsIn, claims: dict = Depends(require(WRITE)), se
 
 
 @router.post("/emails/unarchive", status_code=status.HTTP_204_NO_CONTENT)
-async def unarchive_emails(body: IdsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    rows = await session.scalars(select(Email).where(Email.org_id == _org(claims), Email.id.in_(body.ids)))
+async def unarchive_emails(body: IdsIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
+    rows = await _scoped_emails(session, body.ids, scope)
     for e in rows:
         e.archived_at = None
         e.archived_by = None
@@ -122,12 +213,12 @@ async def unarchive_emails(body: IdsIn, claims: dict = Depends(require(WRITE)), 
 
 
 @router.post("/emails/auto-reply", status_code=status.HTTP_204_NO_CONTENT)
-async def generate_drafts(body: IdsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
+async def generate_drafts(body: IdsIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
     """Manual "generate a draft" action. Most emails already get an AI-drafted
     reply at analysis time (see pipeline.py) — this just surfaces it as a draft.
     Rows analyzed before that shipped have no draft_reply yet, so those fall back
     to a fixed template rather than leaving the button a no-op."""
-    rows = list(await session.scalars(select(Email).where(Email.org_id == _org(claims), Email.id.in_(body.ids))))
+    rows = await _scoped_emails(session, body.ids, scope)
     for e in rows:
         if not e.draft_reply:
             first = (e.sender or "there").split()[0]
@@ -142,19 +233,19 @@ async def generate_drafts(body: IdsIn, claims: dict = Depends(require(WRITE)), s
 
 
 @router.post("/emails/{email_id}/reply/dismiss", status_code=status.HTTP_204_NO_CONTENT)
-async def dismiss_reply(email_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
+async def dismiss_reply(email_id: str, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
     """Human-in-the-loop reject: the AI's draft isn't wanted. The draft stays on
     the row (for audit) but reply_status flips so it drops out of the review queue."""
-    e = await _get_email(session, _org(claims), email_id)
+    e = await _get_email(session, email_id, scope)
     e.reply_status = "rejected"
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/emails/{email_id}/reply", status_code=status.HTTP_204_NO_CONTENT)
-async def send_reply(email_id: str, body: ReplyIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    e = await _get_email(session, _org(claims), email_id)
-    mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == _org(claims)))
+async def send_reply(email_id: str, body: ReplyIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
+    e = await _get_email(session, email_id, scope)
+    mailbox = await session.scalar(select(Mailbox))
     if not mailbox:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
     send_fn = pipeline._send_fn_for(mailbox.provider)
@@ -185,13 +276,12 @@ async def send_reply(email_id: str, body: ReplyIn, claims: dict = Depends(requir
 
 
 @router.post("/emails/{email_id}/retry-summary")
-async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
+async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
     """(Re-)analyzes exactly this one email — the per-email "AI-summarize"
     action, for a "skipped" (never analyzed — see pipeline.py) or "failed" row
     alike. Goes through the same shared analyze_and_persist pipeline.py uses
     everywhere else, so this gets the full result (confidence, needs_reply,
     auto-reply draft, CRM sync, ...), not just summary/category/priority."""
-    org = _org(claims)
     if pipeline.is_analyzing(email_id):
         # Already being analyzed by another call (a sync's own post-fetch
         # auto-analyze, a backlog catch-up, or a second click landing before the
@@ -201,17 +291,17 @@ async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), s
         # actually succeeded, so a retry that visibly succeeds could get
         # silently overwritten back to "failed" moments later.
         raise HTTPException(status.HTTP_409_CONFLICT, "this email is already being analyzed")
-    e = await _get_email(session, org, email_id)
+    e = await _get_email(session, email_id, scope)
     e.summary_status = "pending"
     payload = serialize_email(e)
     await session.commit()
 
-    ctx = await pipeline.load_send_context(org)
+    ctx = await pipeline.load_send_context()
     if ctx is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured for this org")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
     send_creds, provider, auto_reply_enabled = ctx
     await pipeline.analyze_and_persist(
-        org, [(email_id, payload)], auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider,
+        [(email_id, payload)], auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider,
     )
 
     await session.refresh(e)
@@ -220,7 +310,9 @@ async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), s
 
 @router.post("/emails/analyze-backlog")
 async def analyze_backlog(
-    count: int = 100, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)
+    count: int = 100, claims: dict = Depends(require(WRITE)),
+    scope: MailboxScope = Depends(mailbox_scope),
+    session: AsyncSession = Depends(get_session)
 ):
     """Settings' "Summarize previous 100" — manually analyzes the next `count`
     not-yet-analyzed emails (see pipeline.py: a sync only auto-analyzes the most
@@ -228,9 +320,8 @@ async def analyze_backlog(
     Bounded and synchronous (not backgrounded) — a 100-email batch finishes in
     well under the frontend's request timeout, so the button can just show its
     own "summarizing…" state and get a direct result back, no polling needed."""
-    org = _org(claims)
     try:
-        result = await pipeline.analyze_backlog(org, count)
+        result = await pipeline.analyze_backlog(count)
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except LookupError as exc:
@@ -241,13 +332,13 @@ async def analyze_backlog(
 # ---------- folders ----------
 @router.get("/folders")
 async def list_folders(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    rows = await session.scalars(select(Folder).where(Folder.org_id == _org(claims)).order_by(Folder.created_at))
+    rows = await session.scalars(select(Folder).order_by(Folder.created_at))
     return [serialize_folder(f) for f in rows]
 
 
 @router.post("/folders", status_code=status.HTTP_201_CREATED)
 async def create_folder(body: FolderIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    folder = Folder(org_id=_org(claims), name=body.name, color=body.color)
+    folder = Folder(name=body.name, color=body.color)
     session.add(folder)
     await session.commit()
     return serialize_folder(folder)
@@ -255,7 +346,7 @@ async def create_folder(body: FolderIn, claims: dict = Depends(require(WRITE)), 
 
 @router.put("/folders/{folder_id}")
 async def update_folder(folder_id: str, body: FolderPatch, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    f = await session.scalar(select(Folder).where(Folder.org_id == _org(claims), Folder.id == folder_id))
+    f = await session.scalar(select(Folder).where(Folder.id == folder_id))
     if not f:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "folder not found")
     if body.name is not None:
@@ -269,10 +360,10 @@ async def update_folder(folder_id: str, body: FolderPatch, claims: dict = Depend
 @router.delete("/folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_folder(folder_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
     # Contents move to All (folder_id = null) — never cascade-delete the emails.
-    emails = await session.scalars(select(Email).where(Email.org_id == _org(claims), Email.folder_id == folder_id))
+    emails = await session.scalars(select(Email).where(Email.folder_id == folder_id))
     for e in emails:
         e.folder_id = None
-    f = await session.scalar(select(Folder).where(Folder.org_id == _org(claims), Folder.id == folder_id))
+    f = await session.scalar(select(Folder).where(Folder.id == folder_id))
     if f:
         await session.delete(f)
     await session.commit()
@@ -283,36 +374,57 @@ async def delete_folder(folder_id: str, claims: dict = Depends(require(WRITE)), 
 @router.get("/alerts")
 async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     # Filter in SQL rather than pulling every email (body/summary/draft_reply
-    # included) over the wire just to discard most of them in Python — only
-    # High-priority/Security rows are ever returned here.
+    # included) over the wire just to discard most of them in Python.
+    #
+    # Three things raise an alert, per the brief: a safeguarding matter (§5.5 — an
+    # "immediate restricted alert"), an item that could not be classified and so
+    # needs a person (§5.8 exception queue), and anything High priority. The
+    # safeguarding test is on `route` rather than `category` because the
+    # cross-cutting indicator sends an item down the restricted route even when
+    # its primary category is something else entirely.
     rows = await session.scalars(
         select(Email).where(
-            Email.org_id == _org(claims),
-            or_(Email.priority == "High", Email.category == "Security"),
+            or_(
+                Email.priority == "High",
+                Email.route == "safeguarding_restricted",
+                Email.route == "exception",
+            )
         )
     )
     alerts = []
     for e in rows:
-        is_security = e.category == "Security"
-        if e.priority == "High" or is_security:
-            alerts.append({
-                "id": f"a-{e.id}",
-                "emailId": e.id,
-                "type": "classification" if is_security else "priority",
-                "message": (f'Security email flagged: "{e.subject}"' if is_security
-                            else f'High-priority: "{e.subject}"'),
-                "priority": e.priority,
-                "createdAt": e.received_at.isoformat() if e.received_at else None,
-                "archived": e.archived_at is not None,
-            })
+        restricted = e.route == "safeguarding_restricted"
+        exception = e.route == "exception"
+        if restricted:
+            # Deliberately says nothing about the content. §7.2 restricts
+            # safeguarding information to authorised staff, and Appendix E warns
+            # against exposing sensitive detail in alerts — so the alert carries
+            # a pointer, and the email itself stays behind the normal permission
+            # check. The subject line is withheld for the same reason.
+            alert_type, message = "safeguarding", "Restricted safeguarding item requires attention"
+        elif exception:
+            alert_type = "exception"
+            message = f'Could not be classified, needs review: "{e.subject}"'
+        else:
+            alert_type, message = "priority", f'High-priority: "{e.subject}"'
+        alerts.append({
+            "id": f"a-{e.id}",
+            "emailId": e.id,
+            "type": alert_type,
+            "message": message,
+            "priority": "High" if restricted else e.priority,
+            "flags": list(e.flags or []),
+            "createdAt": e.received_at.isoformat() if e.received_at else None,
+            "archived": e.archived_at is not None,
+        })
     return alerts
 
 
 # ---------- agent status ----------
-async def _get_config(session: AsyncSession, org: str) -> AgentConfig:
-    cfg = await session.scalar(select(AgentConfig).where(AgentConfig.org_id == org))
+async def _get_config(session: AsyncSession) -> AgentConfig:
+    cfg = await session.scalar(select(AgentConfig))
     if not cfg:
-        cfg = AgentConfig(org_id=org, fetch_per_run=settings.fetch_per_run, enabled=settings.cron_enabled)
+        cfg = AgentConfig(fetch_per_run=settings.fetch_per_run, enabled=settings.cron_enabled)
         session.add(cfg)
         await session.commit()
     return cfg
@@ -320,9 +432,8 @@ async def _get_config(session: AsyncSession, org: str) -> AgentConfig:
 
 @router.get("/agent/status")
 async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    org = _org(claims)
-    cfg = await _get_config(session, org)
-    runs = list(await session.scalars(select(AgentRun).where(AgentRun.org_id == org).order_by(AgentRun.run_at.desc())))
+    cfg = await _get_config(session)
+    runs = list(await session.scalars(select(AgentRun).order_by(AgentRun.run_at.desc())))
     last = runs[0] if runs else None
 
     daily: dict[str, dict] = {}
@@ -337,7 +448,7 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
         next_run = (last.run_at + timedelta(minutes=_interval_minutes(cfg.cron_interval))).isoformat()
 
     return {
-        "running": pipeline.is_running(org),
+        "running": pipeline.is_running(),
         "config": {
             "cronInterval": cfg.cron_interval, "fetchPerRun": cfg.fetch_per_run, "enabled": cfg.enabled,
             "autoReplyEnabled": cfg.auto_reply_enabled,
@@ -367,7 +478,7 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
 
 @router.put("/settings/agent")
 async def update_agent_config(body: AgentConfigIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    cfg = await _get_config(session, _org(claims))
+    cfg = await _get_config(session)
     if body.cronInterval is not None:
         cfg.cron_interval = body.cronInterval
     if body.fetchPerRun is not None:
@@ -387,7 +498,7 @@ async def update_agent_config(body: AgentConfigIn, claims: dict = Depends(requir
 @router.get("/settings/mailbox")
 async def get_mailbox(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     """Non-secret mailbox settings for prefilling the form. Password is never returned."""
-    mb = await session.scalar(select(Mailbox).where(Mailbox.org_id == _org(claims)))
+    mb = await session.scalar(select(Mailbox))
     if not mb:
         return None
     return {
@@ -407,8 +518,7 @@ async def get_mailbox(claims: dict = Depends(require(READ)), session: AsyncSessi
 
 @router.post("/settings/mailbox")
 async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    org = _org(claims)
-    mailbox = await session.scalar(select(Mailbox).where(Mailbox.org_id == org))
+    mailbox = await session.scalar(select(Mailbox))
     enc = crypto.encrypt(body.password.replace(" ", ""))  # app passwords are shown spaced; store without
     # clientSecret is write-only-if-changed: a blank value keeps whatever was already stored.
     client_secret_enc = (
@@ -446,7 +556,7 @@ async def save_mailbox(body: MailboxIn, claims: dict = Depends(require(WRITE)), 
             mailbox.sync_epoch = (mailbox.sync_epoch or 0) + 1
     else:
         session.add(Mailbox(
-            org_id=org, imap_host=body.imapHost, imap_port=body.imapPort,
+            imap_host=body.imapHost, imap_port=body.imapPort,
             smtp_host=body.smtpHost, smtp_port=body.smtpPort,
             username=body.username, password_enc=enc, enabled=True,
             provider=body.provider, tenant_id=body.tenantId, client_id=body.clientId,
