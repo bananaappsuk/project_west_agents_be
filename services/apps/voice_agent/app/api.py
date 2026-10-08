@@ -34,27 +34,23 @@ WRITE = f"{settings.app_key}:recordings.write"
 _FREQ_MINUTES = {"hourly": 60, "every6h": 360, "daily": 1440}
 
 
-def _org(claims: dict) -> str:
-    return claims["org"]
-
-
-async def _get_recording(session: AsyncSession, org: str, rec_id: str) -> Recording:
-    r = await session.scalar(select(Recording).where(Recording.org_id == org, Recording.id == rec_id))
+async def _get_recording(session: AsyncSession, rec_id: str) -> Recording:
+    r = await session.scalar(select(Recording).where(Recording.id == rec_id))
     if not r:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "recording not found")
     return r
 
 
-async def _get_config(session: AsyncSession, org: str) -> VoiceSettings:
-    """Find-or-create the org's VoiceSettings row. Mirrors mail_agent's `_get_config`:
+async def _get_config(session: AsyncSession) -> VoiceSettings:
+    """Find-or-create the VoiceSettings row. Mirrors mail_agent's `_get_config`:
     the master on/off switch (`enabled`) defaults on the moment the agent is first
     looked at, independent of whether a real recording-source connection has been
     configured yet — same as Email Agent showing "Running" before a mailbox is set
-    up. The scheduler already no-ops gracefully on an enabled-but-unconfigured org
+    up. The scheduler already no-ops gracefully on an enabled-but-unconfigured agent
     (see scheduler.py's "enabled but no endpoint configured — skipping")."""
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    cfg = await session.scalar(select(VoiceSettings))
     if not cfg:
-        cfg = VoiceSettings(org_id=org, enabled=settings.cron_enabled)
+        cfg = VoiceSettings(enabled=settings.cron_enabled)
         session.add(cfg)
         await session.commit()
     return cfg
@@ -67,7 +63,7 @@ async def list_recordings(
     claims: dict = Depends(require(READ)),
     session: AsyncSession = Depends(get_session),
 ):
-    q = select(Recording).where(Recording.org_id == _org(claims)).order_by(Recording.call_date.desc())
+    q = select(Recording).order_by(Recording.call_date.desc())
     if status_filter in ("new", "old"):
         q = q.where(Recording.status == status_filter)
     rows = await session.scalars(q)
@@ -81,26 +77,47 @@ async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSessi
     never drift from what /voice/recordings actually shows."""
     # Filter in SQL rather than pulling every recording (transcript/summary/
     # ai_reply included) over the wire just to discard most of them in Python.
+    # Matches mail_agent's /alerts now that both channels share one taxonomy: a
+    # safeguarding call must raise the same restricted alert as a safeguarding
+    # email (brief §5.5), and an unclassifiable one goes to the same exception
+    # queue (§5.8). The safeguarding test is on `route`, not `category`, because
+    # the cross-cutting indicator sends an item down the restricted route even
+    # when its primary category is something else.
     rows = await session.scalars(
         select(Recording).where(
-            Recording.org_id == _org(claims),
-            or_(Recording.priority == "High", Recording.risk == "High"),
+            or_(
+                Recording.priority == "High",
+                Recording.risk == "High",
+                Recording.route == "safeguarding_restricted",
+                Recording.route == "exception",
+            ),
         )
     )
     alerts = []
     for r in rows:
-        is_high_risk = r.risk == "High"
-        if r.priority == "High" or is_high_risk:
-            title = r.label or r.caller or "Unknown caller"
-            alerts.append({
-                "id": f"a-{r.id}",
-                "recordingId": r.id,
-                "type": "risk" if is_high_risk else "priority",
-                "message": (f'High-risk call flagged: "{title}"' if is_high_risk
-                            else f'High-priority call: "{title}"'),
-                "priority": r.priority,
-                "createdAt": r.created_at.isoformat() if r.created_at else None,
-            })
+        restricted = r.route == "safeguarding_restricted"
+        title = r.label or r.caller or "Unknown caller"
+        if restricted:
+            # Carries no detail about the call, for the same reason the mail
+            # equivalent withholds the subject line: §7.2 restricts safeguarding
+            # information to authorised staff, so the alert is a pointer and the
+            # recording itself stays behind the normal permission check.
+            alert_type, message = "safeguarding", "Restricted safeguarding call requires attention"
+        elif r.route == "exception":
+            alert_type, message = "exception", f'Call could not be classified, needs review: "{title}"'
+        elif r.risk == "High":
+            alert_type, message = "risk", f'High-risk call flagged: "{title}"'
+        else:
+            alert_type, message = "priority", f'High-priority call: "{title}"'
+        alerts.append({
+            "id": f"a-{r.id}",
+            "recordingId": r.id,
+            "type": alert_type,
+            "message": message,
+            "priority": "High" if restricted else r.priority,
+            "flags": list(r.flags or []),
+            "createdAt": r.created_at.isoformat() if r.created_at else None,
+        })
     return alerts
 
 
@@ -111,14 +128,12 @@ async def list_actions(claims: dict = Depends(require(READ)), session: AsyncSess
     call flagged high-risk — as opposed to /alerts (broader: any high-priority OR
     high-risk call) or /stats (aggregate counts only, no actual items). Column-projected
     like /alerts and /stats, not full rows — see the comment on /alerts for why."""
-    org = _org(claims)
     rows = list(await session.execute(
         select(
             Recording.id, Recording.label, Recording.caller, Recording.call_date,
             Recording.category, Recording.priority, Recording.risk,
             Recording.reply_status, Recording.needs_reply,
         ).where(
-            Recording.org_id == org,
             or_(
                 and_(Recording.needs_reply.is_(True), Recording.reply_status.in_(["pending", "edited"])),
                 Recording.risk == "High",
@@ -158,15 +173,14 @@ async def fetch_recordings(
     time), far longer than any request should stay open. Poll GET /voice/agent/status
     (its `running` flag) to know when it's done — that's real server state, so it
     stays correct no matter which page you're on."""
-    org = _org(claims)
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    cfg = await session.scalar(select(VoiceSettings))
     if not cfg or not cfg.enabled:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no recording source configured for this org")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no recording source configured")
 
-    if pipeline.is_running(org):
+    if pipeline.is_running():
         raise HTTPException(status.HTTP_409_CONFLICT, "a sync is already in progress")
 
-    background_tasks.add_task(pipeline.fetch_and_process, org, count, sweep=sweep)
+    background_tasks.add_task(pipeline.fetch_and_process, count, sweep=sweep)
     return {"status": "started"}
 
 
@@ -180,21 +194,20 @@ async def upload_recording(
 ):
     """Hand the agent an audio file directly instead of waiting on the cron sync.
     Reuses the same transcription + analysis steps the BT Cloud/S3 pipeline uses.
-    `save_audio` opts into keeping the file (in the org's already-configured S3-compatible
+    `save_audio` opts into keeping the file (in the already-configured S3-compatible
     bucket) for playback afterward — the default mirrors the rest of the product's
     discard-after-transcribe policy, so BT-Cloud-style recordings with no playback."""
-    org = _org(claims)
     audio = await file.read()
     content_type = file.content_type or "audio/mpeg"
     transcript = await run_in_threadpool(transcribe.transcribe, audio, content_type)
 
     source_type, ext_id = "upload", str(uuid.uuid4())
     if save_audio:
-        cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+        cfg = await session.scalar(select(VoiceSettings))
         if not cfg or not cfg.s3_bucket:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "no S3-compatible storage configured for this org — set one up in Settings to save audio",
+                "no S3-compatible storage configured — set one up in Settings to save audio",
             )
         ext = "wav" if "wav" in content_type else "mp3"
         key = f"uploads/{ext_id}.{ext}"
@@ -222,12 +235,14 @@ async def upload_recording(
         a, analysis_status = {}, "failed"
 
     row = Recording(
-        org_id=org, ext_id=ext_id, source_type=source_type,
+        ext_id=ext_id, source_type=source_type,
         label=(label or "").strip() or None,
         caller=caller, phone="", agent="Uploaded",
         call_date=date.today().isoformat(), duration="",
         transcript=transcript or "(no transcript available)",
-        summary=a.get("summary", ""), category=a.get("category", "General Enquiry"),
+        summary=a.get("summary", ""), category=a.get("category") or "unclassified",
+        flags=list(a.get("flags") or []),
+        route=a.get("route") or "exception",
         priority=a.get("priority", "Medium"), risk=a.get("risk", "Low"), sentiment=a.get("sentiment", "Neutral"),
         needs_reply=bool(a.get("needs_reply", False)), ai_reply=a.get("suggested_reply", "") or "",
         reply_status="pending" if a.get("needs_reply") else "none",
@@ -240,7 +255,7 @@ async def upload_recording(
 
 @router.get("/recordings/{rec_id}")
 async def get_recording(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    return serialize_recording(await _get_recording(session, _org(claims), rec_id))
+    return serialize_recording(await _get_recording(session, rec_id))
 
 
 @router.patch("/recordings/{rec_id}/label")
@@ -249,7 +264,7 @@ async def relabel_recording(
 ):
     """Rename a recording's display name — purely cosmetic (doesn't touch `caller`,
     which for a real call is the actual caller ID, not something to relabel)."""
-    r = await _get_recording(session, _org(claims), rec_id)
+    r = await _get_recording(session, rec_id)
     trimmed = body.label.strip()
     r.label = trimmed or None
     await session.commit()
@@ -262,12 +277,12 @@ async def _fetch_recording_audio(cfg: VoiceSettings | None, r: Recording) -> tup
     recordings are re-fetched from the bucket; BT Cloud recordings are re-fetched from
     RingCentral using a fresh/cached access token (see bt_client.fetch_audio) — only
     possible for recordings synced after content_uri started being captured, with a JWT
-    still configured for the org. Shared by GET .../audio (playback) and
+    still configured. Shared by GET .../audio (playback) and
     POST .../retry-analysis (re-transcribing a recording whose transcript never came
     through)."""
     if r.source_type == "s3":
         if not cfg or not cfg.s3_bucket:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured for this org")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured")
         try:
             return await run_in_threadpool(
                 s3_client.download,
@@ -297,9 +312,8 @@ async def _fetch_recording_audio(cfg: VoiceSettings | None, r: Recording) -> tup
 
 @router.get("/recordings/{rec_id}/audio")
 async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    org = _org(claims)
-    r = await _get_recording(session, org, rec_id)
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    r = await _get_recording(session, rec_id)
+    cfg = await session.scalar(select(VoiceSettings))
     audio, content_type = await _fetch_recording_audio(cfg, r)
     return Response(content=audio, media_type=content_type)
 
@@ -313,7 +327,6 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
     Re-fetches audio on demand the same way GET .../audio does — nothing is stored
     locally between syncs. Goes through the same fields the sync pipeline persists
     (summary/category/..., CRM sync), not just a bare re-transcribe."""
-    org = _org(claims)
     if not pipeline.try_claim_analyzing(rec_id):
         # Already being analyzed by another call (the sync's own post-fetch
         # analyze step re-queuing this same stuck-pending row, or a second click
@@ -322,8 +335,8 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
         # retry that visibly succeeds get silently overwritten back to "failed".
         raise HTTPException(status.HTTP_409_CONFLICT, "this recording is already being analyzed")
     try:
-        r = await _get_recording(session, org, rec_id)
-        cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+        r = await _get_recording(session, rec_id)
+        cfg = await session.scalar(select(VoiceSettings))
 
         transcript = r.transcript
         if not transcript or transcript == "(no transcript available)":
@@ -351,7 +364,9 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
         if ok:
             crm_status, crm_ref, activity_ref = await crm_sync.after_call_analysis(payload, a)
             r.summary = a.get("summary", "")
-            r.category = a.get("category", "General Enquiry")
+            r.category = a.get("category") or "unclassified"
+            r.flags = list(a.get("flags") or [])
+            r.route = a.get("route") or "exception"
             r.priority = a.get("priority", "Medium")
             r.risk = a.get("risk", "Low")
             r.sentiment = a.get("sentiment", "Neutral")
@@ -374,15 +389,15 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
 # ---------- human-in-the-loop reply ----------
 @router.post("/recordings/{rec_id}/reply/draft")
 async def save_reply_draft(rec_id: str, body: ReplyDraftIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    r = await _get_recording(session, _org(claims), rec_id)
+    r = await _get_recording(session, rec_id)
     r.ai_reply = body.body
     r.reply_status = "edited"
     await session.commit()
     return serialize_recording(r)
 
 
-async def _set_reply_status(rec_id: str, org: str, new_status: str, session: AsyncSession) -> dict:
-    r = await _get_recording(session, org, rec_id)
+async def _set_reply_status(rec_id: str, new_status: str, session: AsyncSession) -> dict:
+    r = await _get_recording(session, rec_id)
     r.reply_status = new_status
     await session.commit()
     return serialize_recording(r)
@@ -390,23 +405,22 @@ async def _set_reply_status(rec_id: str, org: str, new_status: str, session: Asy
 
 @router.post("/recordings/{rec_id}/reply/approve")
 async def approve_reply(rec_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    return await _set_reply_status(rec_id, _org(claims), "approved", session)
+    return await _set_reply_status(rec_id, "approved", session)
 
 
 @router.post("/recordings/{rec_id}/reply/reject")
 async def reject_reply(rec_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    return await _set_reply_status(rec_id, _org(claims), "rejected", session)
+    return await _set_reply_status(rec_id, "rejected", session)
 
 
 @router.post("/recordings/{rec_id}/reply/send")
 async def send_reply(rec_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    return await _set_reply_status(rec_id, _org(claims), "sent", session)
+    return await _set_reply_status(rec_id, "sent", session)
 
 
 # ---------- dashboard stats ----------
 @router.get("/stats")
 async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    org = _org(claims)
     # Only the small classification columns these counts need — not full rows,
     # which would drag every recording's transcript/summary/ai_reply (the
     # largest columns in the schema) over the wire just to tally counters.
@@ -414,11 +428,21 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
         select(
             Recording.status, Recording.reply_status, Recording.risk,
             Recording.category, Recording.sentiment, Recording.agent,
-        ).where(Recording.org_id == org)
+        )
     ))
-    cfg = await _get_config(session, org)
+    cfg = await _get_config(session)
 
-    categories = ["Sales Enquiry", "Complaint", "Support", "Booking", "Billing", "General Enquiry"]
+    # The controlled PW taxonomy (agent_factory/app/taxonomy.py). Listed here rather
+    # than imported because the agent factory is a separate service — the frontend
+    # holds the display labels, so this only needs the codes, in brief Reference 1's
+    # own order. A breakdown row is emitted even at zero so the chart keeps a stable
+    # set of series between refreshes.
+    categories = [
+        "general_enquiry", "new_referral", "referral_update", "returned_part_2",
+        "case_correspondence", "payment_or_finance", "complaint", "safeguarding_concern",
+        "report_or_document", "scheduling_change", "court_or_legal", "supplier_or_admin",
+        "unclassified",
+    ]
     sentiments = ["Positive", "Neutral", "Negative"]
     agents = sorted({r.agent for r in rows if r.agent})
 
@@ -446,9 +470,9 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
 @router.get("/settings")
 async def get_settings(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     """Non-secret settings for prefilling the form. Secrets are never returned. Both source
-    field sets are always returned — the org may have one configured but currently be pointed
+    field sets are always returned — one may be configured but currently pointed
     at the other, and the form shouldn't lose it when the admin isn't looking at that tab."""
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == _org(claims)))
+    cfg = await session.scalar(select(VoiceSettings))
     if not cfg:
         return None
     return {
@@ -475,8 +499,7 @@ async def get_settings(claims: dict = Depends(require(READ)), session: AsyncSess
 
 @router.post("/settings")
 async def save_settings(body: SettingsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    org = _org(claims)
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org))
+    cfg = await session.scalar(select(VoiceSettings))
     # Blank secret / jwt / s3 secret on save means "keep the stored one".
     enc = crypto.encrypt(body.clientSecret) if body.clientSecret else (cfg.client_secret_enc if cfg else "")
     jwt_enc = crypto.encrypt(body.jwt) if body.jwt else (cfg.jwt_enc if cfg else "")
@@ -489,7 +512,7 @@ async def save_settings(body: SettingsIn, claims: dict = Depends(require(WRITE))
         cfg.cron_frequency, cfg.cron_time, cfg.enabled = body.cronFrequency, body.cronTime, body.enabled
     else:
         session.add(VoiceSettings(
-            org_id=org, source_type=body.sourceType,
+            source_type=body.sourceType,
             endpoint=body.endpoint, client_id=body.clientId, client_secret_enc=enc, jwt_enc=jwt_enc,
             s3_endpoint=body.s3Endpoint, s3_region=body.s3Region, s3_bucket=body.s3Bucket,
             s3_prefix=body.s3Prefix, s3_access_key_id=body.s3AccessKeyId, s3_secret_access_key_enc=s3_secret_enc,
@@ -501,7 +524,7 @@ async def save_settings(body: SettingsIn, claims: dict = Depends(require(WRITE))
 
 @router.post("/settings/test")
 async def test_settings(body: SettingsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    cfg = await session.scalar(select(VoiceSettings).where(VoiceSettings.org_id == _org(claims)))
+    cfg = await session.scalar(select(VoiceSettings))
     try:
         if body.sourceType == "s3":
             secret = body.s3SecretAccessKey or (crypto.decrypt(cfg.s3_secret_access_key_enc) if (cfg and cfg.s3_secret_access_key_enc) else "")
@@ -528,14 +551,14 @@ async def test_settings(body: SettingsIn, claims: dict = Depends(require(WRITE))
 @router.get("/notifications")
 async def list_notifications(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     rows = await session.scalars(
-        select(Notification).where(Notification.org_id == _org(claims)).order_by(Notification.created_at.desc()).limit(30)
+        select(Notification).order_by(Notification.created_at.desc()).limit(30)
     )
     return [serialize_notification(n) for n in rows]
 
 
 @router.post("/notifications/read-all", status_code=status.HTTP_204_NO_CONTENT)
 async def mark_all_read(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    rows = await session.scalars(select(Notification).where(Notification.org_id == _org(claims), Notification.read.is_(False)))
+    rows = await session.scalars(select(Notification).where(Notification.read.is_(False)))
     for n in rows:
         n.read = True
     await session.commit()
@@ -545,9 +568,8 @@ async def mark_all_read(claims: dict = Depends(require(READ)), session: AsyncSes
 # ---------- agent / cron status ----------
 @router.get("/agent/status")
 async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    org = _org(claims)
-    cfg = await _get_config(session, org)
-    runs = list(await session.scalars(select(AgentRun).where(AgentRun.org_id == org).order_by(AgentRun.run_at.desc())))
+    cfg = await _get_config(session)
+    runs = list(await session.scalars(select(AgentRun).order_by(AgentRun.run_at.desc())))
     last = runs[0] if runs else None
 
     daily: dict[str, dict] = {}
@@ -563,7 +585,7 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
         next_run = (last.run_at + timedelta(minutes=interval)).isoformat()
 
     return {
-        "running": pipeline.is_running(org),
+        "running": pipeline.is_running(),
         "config": {
             "cronFrequency": cfg.cron_frequency,
             "cronTime": cfg.cron_time,
