@@ -16,3 +16,5 @@ __pycache__/
 # Keys (dev-generated signing keys)
 keys/
 *.pem
+# Exchange PowerShell session dump (tenant data, not source)
+mail_output.txt
