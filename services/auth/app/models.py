@@ -13,6 +13,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -58,6 +59,15 @@ class User(Base):
     # (a pre-Entra row is bound by UPN = email once; see routers/entra.py).
     entra_oid: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
     entra_upn: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Entra security-group object ids, captured at each sign-in.
+    #
+    # Stored because a REFRESH has no Entra token to read them from: the user
+    # presents our refresh token, not Microsoft's. Without this the groups claim
+    # survives only until the first refresh (15 minutes), after which every
+    # downstream service sees a user who belongs to nothing and silently loses
+    # all mailbox access. Re-written on every sign-in, so removing someone from a
+    # group takes effect at their next sign-in rather than persisting forever.
+    entra_groups: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     full_name: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
