@@ -16,6 +16,7 @@ from typing import TypedDict
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+from ... import taxonomy
 from ...base import BaseAgent
 from ...config import settings
 from ...llm import analyze_call
@@ -26,6 +27,8 @@ class CallState(TypedDict, total=False):
     email: dict       # the call record (generic input slot from the invoke API)
     analysis: dict    # CallAnalysis as a dict
     escalate: bool
+    route: str        # the queue this call belongs in (taxonomy.Queue)
+    restricted: bool  # safeguarding — restricted handling
 
 
 def _analyze(state: CallState) -> dict:
@@ -33,8 +36,18 @@ def _analyze(state: CallState) -> dict:
 
 
 def _guardrail(state: CallState) -> dict:
-    confidence = (state.get("analysis") or {}).get("confidence", 0.0)
-    return {"escalate": confidence < settings.confidence_threshold}
+    """Routes the call through the same taxonomy the mail agent uses — a
+    safeguarding disclosure on a phone call reaches the restricted route exactly
+    as it would by email, rather than depending on which channel it arrived on."""
+    analysis = state.get("analysis") or {}
+    category = analysis.get("category", "unclassified")
+    flags = analysis.get("flags") or []
+    confidence = analysis.get("confidence", 0.0)
+    return {
+        "escalate": confidence < settings.confidence_threshold or "uncertain" in flags,
+        "route": taxonomy.route_for(category, flags),
+        "restricted": taxonomy.is_safeguarding(category, flags),
+    }
 
 
 @register
