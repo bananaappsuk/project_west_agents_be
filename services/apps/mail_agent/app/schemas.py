@@ -78,6 +78,8 @@ def serialize_email(e: Email) -> dict:
         "contentType": e.content_type or "text",
         "summary": e.summary or "",
         "category": e.category or "",
+        "flags": list(e.flags or []),
+        "route": e.route or "",
         "priority": e.priority or "Medium",
         "confidence": e.confidence or 0.0,
         "needsReply": e.needs_reply,
@@ -92,6 +94,36 @@ def serialize_email(e: Email) -> dict:
         "folderId": e.folder_id,
         "archivedAt": e.archived_at.isoformat() if e.archived_at else None,
         "archivedBy": e.archived_by,
+        # Which shared mailbox this arrived in, and the business address the sender
+        # actually used. The UI needs both: the mailbox to group and filter by, the
+        # receiving address to show WHY an item is in a queue -- a message in
+        # coordinator@ reads very differently once you can see it came via
+        # complaints@ rather than safeguarding@.
+        "mailboxId": e.mailbox_id,
+        "receivingAddress": e.receiving_address,
+        "originalRecipient": e.original_recipient,
+        # resolved_single | resolved_precedence | ambiguous | unresolved | legacy.
+        # Never read receivingAddress without this: on a non-resolved row the
+        # address is a storage placeholder, not a determination.
+        "receivingAddressStatus": e.receiving_address_status,
+        "restricted": bool(e.restricted),
+    }
+
+
+def serialize_mailbox(m, *, can_read: bool, can_send: bool, can_approve: bool) -> dict:
+    """A mailbox as the signed-in user may act on it.
+
+    Rights are per user, so they are serialised alongside the mailbox rather than
+    being a property of it -- the same mailbox is read-only for one person and
+    sendable for another.
+    """
+    return {
+        "id": m.id,
+        "address": m.address,
+        "displayName": m.display_name,
+        "canRead": can_read,
+        "canSend": can_send,
+        "canApprove": can_approve,
     }
 
 
