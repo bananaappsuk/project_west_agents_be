@@ -154,6 +154,39 @@ async def _app_for(session: AsyncSession, key: str) -> Application:
     return app
 
 
+def _entra_groups(claims: dict) -> list[str]:
+    """Entra security-group object ids from the signed-in user's token.
+
+    These are passed through to the agent access tokens so the mail agent can
+    resolve which shared mailboxes the person may read and send from. Only raw
+    group ids travel; the resolved mailbox set is never put in a token.
+
+    Entra replaces the `groups` claim with `_claim_names`/`_claim_sources` once a
+    user is in roughly 200+ groups. That is unlikely at Project West's size, but it
+    is logged rather than ignored: silently treating an overage as "no groups" would
+    revoke everyone's mailbox access at once, and would look to the user like an
+    empty inbox rather than an error.
+    """
+    raw = claims.get("groups")
+    if isinstance(raw, (list, tuple)):
+        log.info("AUDIT entra groups oid=%s count=%d", claims.get("oid"), len(raw))
+        return [str(g) for g in raw if g]
+
+    # Neither a groups claim nor an overage indicator. Logged with the claim names
+    # present because the two causes are indistinguishable downstream: the app
+    # registration is not emitting the claim, or the caller presented a token
+    # minted before it was turned on. Claim NAMES only -- never their values.
+    log.warning("AUDIT entra NO groups claim oid=%s claims_present=%s",
+                claims.get("oid"), sorted(claims.keys()))
+    if "_claim_names" in claims or "_claim_sources" in claims:
+        log.warning(
+            "AUDIT entra groups overage for oid %s - group claim omitted by Entra; "
+            "mailbox access cannot be resolved from this token",
+            claims.get("oid"),
+        )
+    return []
+
+
 @router.post("/entra", response_model=EntraTokensOut)
 async def entra_sign_in(authorization: str | None = Header(default=None), session: AsyncSession = Depends(get_session)):
     try:
@@ -173,6 +206,10 @@ async def entra_sign_in(authorization: str | None = Header(default=None), sessio
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "organization not set up — run scripts/seed_org.py")
 
     user = await _find_or_provision_user(session, claims)
+    groups = _entra_groups(claims)
+    # Persisted so a token REFRESH can reproduce them -- see User.entra_groups.
+    # Written every sign-in, so a group removal in Entra lands here too.
+    user.entra_groups = groups
 
     tokens: dict[str, TokenOut] = {}
     for app_key in AGENT_APPS:
@@ -190,7 +227,8 @@ async def entra_sign_in(authorization: str | None = Header(default=None), sessio
             membership.roles = [app_role]
         roles, scope = _token_fields(app.key, membership)
         tokens[app_key] = await _issue_tokens(
-            session, user=user, org_id=org.id, app=app, roles=roles, scope=scope, commit=False
+            session, user=user, org_id=org.id, app=app, roles=roles, scope=scope,
+            groups=groups, commit=False
         )
 
     await session.commit()
