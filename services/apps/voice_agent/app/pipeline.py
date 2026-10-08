@@ -25,7 +25,7 @@ log = logging.getLogger("voice_agent.pipeline")
 # now" click and a cron tick landing at the same moment, or a double-click. Only
 # valid because this service runs as a single process (see run-all.ps1 — no
 # --workers); the scheduler's own tick-pileup guard defers to this same set.
-_running: set[str] = set()
+_running = False
 
 # In-memory guard against two concurrent analyze attempts for the *same
 # recording* — a manual retry (api.py's /recordings/{id}/retry-analysis)
@@ -34,7 +34,7 @@ _running: set[str] = set()
 # own result and whichever commits last wins regardless of which one actually
 # succeeded, so a retry that visibly succeeds could get silently overwritten
 # back to "failed" moments later. Scoped per-recording, not per-org like
-# `_running`, since analyzing unrelated recordings in the same org concurrently
+# `_running`, since analyzing unrelated recordings concurrently
 # is fine.
 _analyzing: set[str] = set()
 
@@ -64,11 +64,11 @@ def release_analyzing(rec_id: str) -> None:
 _STUCK_PENDING_AFTER = timedelta(minutes=10)
 
 
-def is_running(org_id: str) -> bool:
-    return org_id in _running
+def is_running() -> bool:
+    return _running
 
 
-async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> list[str]:
+async def fetch_and_process(count: int, *, sweep: bool = False) -> list[str]:
     """Returns the ids of newly-fetched recordings. Raises RuntimeError if a run
     for this org is already in progress.
 
@@ -78,21 +78,22 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
     created up front with status="running" so any page can poll GET /voice/agent/status
     to see progress, regardless of which page issued the request or whether that
     page is even still mounted."""
-    if org_id in _running:
-        raise RuntimeError(f"a sync is already in progress for org={org_id}")
-    _running.add(org_id)
+    global _running
+    if _running:
+        raise RuntimeError("a sync is already in progress")
+    _running = True
 
     async with SessionLocal() as s:
-        run = AgentRun(org_id=org_id, status="running")
+        run = AgentRun(status="running")
         s.add(run)
         await s.commit()
         run_id = run.id
-    log.info("fetch start: org=%s count=%d sweep=%s run=%s", org_id, count, sweep, run_id)
+    log.info("fetch start: count=%d sweep=%s run=%s", count, sweep, run_id)
 
     try:
-        return await _run(org_id, count, sweep, run_id)
+        return await _run(count, sweep, run_id)
     except Exception as exc:
-        log.exception("fetch FAILED: org=%s run=%s", org_id, run_id)
+        log.exception("fetch FAILED: run=%s", run_id)
         async with SessionLocal() as s:
             r = await s.get(AgentRun, run_id)
             if r:
@@ -101,15 +102,15 @@ async def fetch_and_process(org_id: str, count: int, *, sweep: bool = False) -> 
                 await s.commit()
         raise
     finally:
-        _running.discard(org_id)
+        _running = False
 
 
-async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
+async def _run(count: int, sweep: bool, run_id: str) -> list[str]:
     # 1) short txn: read the org's connection settings for whichever source is active
     async with SessionLocal() as s:
-        cfg = await s.scalar(select(VoiceSettings).where(VoiceSettings.org_id == org_id))
+        cfg = await s.scalar(select(VoiceSettings))
         if not cfg or not cfg.enabled:
-            log.warning("fetch aborted: org=%s has no enabled recording source connection", org_id)
+            log.warning("fetch aborted: no enabled recording source connection")
             raise LookupError("no recording source configured for this org")
         source_type = cfg.source_type
         if source_type == "s3":
@@ -156,7 +157,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
         # rolled back every already-flushed recording in this transaction.
         fetched_ext_ids = [m["ext_id"] for m in recordings]
         known_ext_ids = set(await s.scalars(
-            select(Recording.ext_id).where(Recording.org_id == org_id, Recording.ext_id.in_(fetched_ext_ids))
+            select(Recording.ext_id).where(Recording.ext_id.in_(fetched_ext_ids))
         )) if fetched_ext_ids else set()
         seen_ext_ids: set[str] = set()
         fresh = []
@@ -199,7 +200,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
             # driving up Neon's data-transfer usage on every sweep.
             result = await s.execute(
                 sa_update(Recording)
-                .where(Recording.org_id == org_id, Recording.status == "new")
+                .where(Recording.status == "new")
                 .values(status="old")
             )
             if result.rowcount and result.rowcount > 0:
@@ -207,7 +208,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
 
         for m in fresh:
             row = Recording(
-                org_id=org_id, ext_id=m["ext_id"], source_type=source_type, caller=m["caller"], phone=m["phone"],
+                ext_id=m["ext_id"], source_type=source_type, caller=m["caller"], phone=m["phone"],
                 agent=m["agent"], call_date=m["date"], duration=m["duration"],
                 transcript=m["transcript"], content_uri=m.get("content_uri"),
                 status="new", analysis_status="pending",
@@ -226,8 +227,7 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
         # already-stored transcript, no need to re-fetch/re-transcribe it.
         stale_cutoff = datetime.now(timezone.utc) - _STUCK_PENDING_AFTER
         stuck = list(await s.scalars(
-            select(Recording).where(
-                Recording.org_id == org_id, Recording.analysis_status == "pending",
+            select(Recording).where( Recording.analysis_status == "pending",
                 Recording.created_at < stale_cutoff,
             )
         ))
@@ -290,7 +290,9 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                     continue
                 if ok:
                     r.summary = a.get("summary", "")
-                    r.category = a.get("category", "General Enquiry")
+                    r.category = a.get("category") or "unclassified"
+                    r.flags = list(a.get("flags") or [])
+                    r.route = a.get("route") or "exception"
                     r.priority = a.get("priority", "Medium")
                     r.risk = a.get("risk", "Low")
                     r.sentiment = a.get("sentiment", "Neutral")
@@ -311,11 +313,11 @@ async def _run(org_id: str, count: int, sweep: bool, run_id: str) -> list[str]:
                 run.status = "success" if all_ok else "partial"
             if new:
                 source_label = "an S3-compatible bucket" if source_type == "s3" else "BT Cloud"
-                s.add(Notification(org_id=org_id, text=f"{len(new)} new recordings fetched from {source_label}"))
+                s.add(Notification(text=f"{len(new)} new recordings fetched from {source_label}"))
             await s.commit()
     finally:
         for rid in claimed:
             release_analyzing(rid)
 
-    log.info("run recorded: org=%s fetched=%d processed=%d high_risk=%d", org_id, len(recordings), len(new), high)
+    log.info("run recorded: fetched=%d processed=%d high_risk=%d", len(recordings), len(new), high)
     return [rid for rid, _ in new]
