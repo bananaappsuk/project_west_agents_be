@@ -1,9 +1,9 @@
-"""Background scheduler, driven by each org's VoiceSettings (BT Cloud cron config).
+"""Background scheduler, driven by VoiceSettings (BT Cloud cron config).
 
-A tick fires every CRON_TICK_MINUTES. On each tick, for every org whose VoiceSettings
-is enabled (and has BT Cloud creds), it runs the fetch pipeline **if** enough time has
-elapsed since that org's last run to satisfy its chosen frequency. CRON_ENABLED is the
-master on/off switch.
+A tick fires every CRON_TICK_MINUTES. On each tick, if VoiceSettings is enabled (and
+has BT Cloud creds), it runs the fetch pipeline **if** enough time has elapsed since
+the last run to satisfy the chosen frequency. CRON_ENABLED is the master on/off
+switch.
 """
 
 from __future__ import annotations
@@ -35,43 +35,38 @@ def _interval_minutes(freq: str) -> int:
 
 async def _tick() -> None:
     async with SessionLocal() as session:
-        enabled = list(await session.scalars(
-            select(VoiceSettings).where(VoiceSettings.enabled.is_(True))
-        ))
+        cfg = await session.scalar(select(VoiceSettings))
 
-    log.info("tick: %d org(s) with a BT Cloud connection enabled", len(enabled))
+    if cfg is None or not cfg.enabled:
+        log.info("tick: no enabled recording source — nothing to do")
+        return
+    if pipeline.is_running():
+        log.info("previous run still in progress — skipping this tick")
+        return
+    if not cfg.endpoint:
+        log.info("enabled but no endpoint configured — skipping")
+        return
+
     now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        last_run = await session.scalar(select(func.max(AgentRun.run_at)))
+        interval = _interval_minutes(cfg.cron_frequency)
+        if last_run is not None:
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+            if (now - last_run) < timedelta(minutes=interval):
+                due_in = interval - int((now - last_run).total_seconds() // 60)
+                log.info("not due yet (interval=%dm, ~%dm remaining)", interval, due_in)
+                return
 
-    for cfg in enabled:
-        if pipeline.is_running(cfg.org_id):
-            log.info("org=%s previous run still in progress — skipping", cfg.org_id)
-            continue
-        if not cfg.endpoint:
-            log.info("org=%s enabled but no endpoint configured — skipping", cfg.org_id)
-            continue
-
-        async with SessionLocal() as session:
-            last_run = await session.scalar(
-                select(func.max(AgentRun.run_at)).where(AgentRun.org_id == cfg.org_id)
-            )
-            interval = _interval_minutes(cfg.cron_frequency)
-            if last_run is not None:
-                if last_run.tzinfo is None:
-                    last_run = last_run.replace(tzinfo=timezone.utc)
-                if (now - last_run) < timedelta(minutes=interval):
-                    due_in = interval - int((now - last_run).total_seconds() // 60)
-                    log.info("org=%s not due yet (interval=%dm, ~%dm remaining)", cfg.org_id, interval, due_in)
-                    continue
-
-        # pipeline.py owns the running-guard and already logs + records failure on
-        # the AgentRun row itself — this catch just keeps one org's failure from
-        # stopping the tick loop from reaching the rest.
-        log.info("org=%s DUE — running fetch (interval=%dm)", cfg.org_id, interval)
-        try:
-            new = await pipeline.fetch_and_process(cfg.org_id, settings.fetch_per_run, sweep=True)
-            log.info("org=%s cron run complete — %d new recording(s)", cfg.org_id, len(new))
-        except Exception:
-            log.exception("org=%s cron run FAILED", cfg.org_id)
+    # pipeline.py owns the running-guard and already logs + records failure on the
+    # AgentRun row itself — this catch just keeps a failure from killing the job.
+    log.info("DUE — running fetch (interval=%dm)", interval)
+    try:
+        new = await pipeline.fetch_and_process(settings.fetch_per_run, sweep=True)
+        log.info("cron run complete — %d new recording(s)", len(new))
+    except Exception:
+        log.exception("cron run FAILED")
 
 
 def start() -> None:
