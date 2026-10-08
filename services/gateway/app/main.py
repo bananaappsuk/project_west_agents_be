@@ -31,6 +31,7 @@ ROUTES: list[tuple[str, str]] = sorted(
         ("/admin", settings.auth_url),
         ("/common", settings.auth_url),
         ("/emails", settings.mail_agent_url),
+        ("/mailboxes", settings.mail_agent_url),  # the approved shared mailboxes this user may read
         ("/folders", settings.mail_agent_url),
         ("/alerts", settings.mail_agent_url),
         ("/settings", settings.mail_agent_url),
