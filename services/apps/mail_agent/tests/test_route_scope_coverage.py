@@ -31,10 +31,33 @@ UNSCOPED_ALLOWED = {
 
 
 def _email_routes():
-    """Routes that can reach email rows."""
+    """Routes that can reach email rows.
+
+    Found by looking at what each handler actually touches, not by its path. The
+    first version of this guard matched on a "/emails" prefix, which let
+    GET /alerts through: it reads Email rows and quotes subject lines into its
+    response, but its path does not begin with /emails, so it was never examined
+    and a user authorised for no mailbox could read 100 subjects. A route is
+    dangerous because of the rows it reaches, so that is what gets tested.
+    """
     for r in router.routes:
         path = getattr(r, "path", "")
-        if not path.startswith("/emails"):
+        endpoint = getattr(r, "endpoint", None)
+        if endpoint is None:
+            continue
+        try:
+            source = inspect.getsource(endpoint)
+        except (OSError, TypeError):  # pragma: no cover - builtins, C callables
+            source = ""
+        # Either test is enough on its own. The path rule keeps every /emails route
+        # covered including the ones that reach rows through a helper and so never
+        # name Email themselves; the source rule catches routes outside that prefix.
+        touches_email = (
+            "Email" in source
+            or "_get_email" in source
+            or "_scoped_emails" in source
+        )
+        if not path.startswith("/emails") and not touches_email:
             continue
         yield path, r
 

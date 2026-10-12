@@ -358,9 +358,24 @@ async def update_folder(folder_id: str, body: FolderPatch, claims: dict = Depend
 
 
 @router.delete("/folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_folder(folder_id: str, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
+async def delete_folder(
+    folder_id: str,
+    claims: dict = Depends(require(WRITE)),
+    scope: MailboxScope = Depends(mailbox_scope),
+    session: AsyncSession = Depends(get_session),
+):
     # Contents move to All (folder_id = null) — never cascade-delete the emails.
-    emails = await session.scalars(select(Email).where(Email.folder_id == folder_id))
+    #
+    # Restricted to the caller's own mailboxes: without that, deleting a folder
+    # reaches across every mailbox in the tenant and clears the folder assignment on
+    # mail the caller cannot see. It writes rather than reads, so it discloses
+    # nothing, but it is still someone else's queue being modified.
+    emails = await session.scalars(
+        select(Email).where(
+            Email.folder_id == folder_id,
+            Email.mailbox_id.in_(scope.narrow(None)),
+        )
+    )
     for e in emails:
         e.folder_id = None
     f = await session.scalar(select(Folder).where(Folder.id == folder_id))
@@ -372,7 +387,11 @@ async def delete_folder(folder_id: str, claims: dict = Depends(require(WRITE)), 
 
 # ---------- alerts ----------
 @router.get("/alerts")
-async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
+async def list_alerts(
+    claims: dict = Depends(require(READ)),
+    scope: MailboxScope = Depends(mailbox_scope),
+    session: AsyncSession = Depends(get_session),
+):
     # Filter in SQL rather than pulling every email (body/summary/draft_reply
     # included) over the wire just to discard most of them in Python.
     #
@@ -382,15 +401,27 @@ async def list_alerts(claims: dict = Depends(require(READ)), session: AsyncSessi
     # safeguarding test is on `route` rather than `category` because the
     # cross-cutting indicator sends an item down the restricted route even when
     # its primary category is something else entirely.
-    rows = await session.scalars(
-        select(Email).where(
-            or_(
-                Email.priority == "High",
-                Email.route == "safeguarding_restricted",
-                Email.route == "exception",
-            )
-        )
+    #
+    # Scoped exactly like the mail list. An alert's `message` quotes the subject
+    # line, so an unscoped query here hands someone the subjects of mail they are
+    # not authorised to open -- which is the disclosure the mailbox check exists to
+    # prevent, arriving by a different route. Empty scope returns no alerts rather
+    # than raising: the user already gets the explicit "not authorised" error from
+    # the mailbox list, and a second banner on the badge adds nothing.
+    if scope.is_empty:
+        return []
+    stmt = select(Email).where(
+        Email.mailbox_id.in_(scope.narrow(None)),
+        or_(
+            Email.priority == "High",
+            Email.route == "safeguarding_restricted",
+            Email.route == "exception",
+        ),
     )
+    # Restricted items keep raising an alert for anyone who may read the mailbox,
+    # cleared or not -- that is the point of §5.5's immediate alert, and the message
+    # below carries no detail. The email itself stays behind the clearance check.
+    rows = await session.scalars(stmt)
     alerts = []
     for e in rows:
         restricted = e.route == "safeguarding_restricted"
