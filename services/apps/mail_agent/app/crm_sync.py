@@ -15,6 +15,7 @@ that neither did, and why).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -43,6 +44,28 @@ _SERVICE_TYPES = {
 def _enum_or_none(value: str, allowed: set[str]) -> str | None:
     v = (value or "").strip().upper()
     return v if v in allowed else None
+
+
+def _idempotency_key(uid: str) -> str:
+    """A 64-character key derived from the Graph message id.
+
+    The CRM's `idempotency_key` is capped at 120 characters and a Graph message id
+    is 152, which rejected every referral we ever sent with a 422 while the same
+    string passed as `external_ref` (capped at 160). That asymmetry is the whole
+    reason activity rows arrived and referrals did not.
+
+    Hashed rather than truncated, on the CRM's own advice and for a reason worth
+    recording: a Graph id leads with the mailbox and folder and carries the
+    message's own bytes at the END, so two messages in one mailbox share a long
+    prefix. A clipped key could collide, and the CRM has a unique index on
+    (source_system, idempotency_key) — the second referral would be read as a
+    replay of the first and handed back the first one's reference. A 201, no
+    error, and a real referral silently lost. Far worse than the 422.
+
+    SHA-256 of the full id is deterministic, so a retry of the same email produces
+    the same key and still dedupes, and collisions are not a practical concern.
+    """
+    return hashlib.sha256((uid or "").encode("utf-8")).hexdigest()
 
 
 async def _upload_attachments(attachments: list[dict]) -> list[dict]:
@@ -123,7 +146,7 @@ async def after_email_analysis(
         if intent == "REFERRAL":
             payload = {
                 "channel": "EMAIL_AGENT",
-                "idempotency_key": uid,
+                "idempotency_key": _idempotency_key(uid),
                 "referrer_name": analysis.get("referrer_name") or sender,
                 "referrer_email": from_email,
                 "referrer_type": _enum_or_none(analysis.get("referrer_type") or "SELF", _REFERRER_TYPES) or "SELF",

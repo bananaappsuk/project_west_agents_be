@@ -120,8 +120,17 @@ def _is_real_key() -> bool:
 def analyze_email(email: dict) -> MailAnalysis:
     result = _analyze_llm(email) if _is_real_key() else _analyze_stub(email)
     text = f"{email.get('subject', '')} {email.get('body', '')}"
-    result.case_ref = _find_case_ref(text) or result.case_ref
-    result.meeting_reference = _find_meeting_ref(text) or result.meeting_reference
+    # The model's own answer is kept only when it is itself a well-formed PW
+    # reference. Falling back to it unchecked let a court or local-authority
+    # reference through as a case_ref — "ZE25P00344" reads like a case number to a
+    # model, but the CRM hard-404s an unknown case_ref, so it would be sent and
+    # rejected. Discarding it leaves the item skipped for a coordinator to link,
+    # which is the safe outcome: a contact filed against the wrong family's case is
+    # worse than one filed against none.
+    result.case_ref = _find_case_ref(text) or _find_case_ref(result.case_ref)
+    result.meeting_reference = (
+        _find_meeting_ref(text) or _find_meeting_ref(result.meeting_reference)
+    )
     return result
 
 
@@ -243,8 +252,14 @@ class CallAnalysis(CrmFields):
 def analyze_call(call: dict) -> CallAnalysis:
     result = _analyze_call_llm(call) if _is_real_key() else _analyze_call_stub(call)
     text = call.get("transcript") or ""
-    result.case_ref = _find_case_ref(text) or result.case_ref
-    result.meeting_reference = _find_meeting_ref(text) or result.meeting_reference
+    # Same guard as analyze_email: a reference the model produced is kept only if
+    # it matches the CRM's own format. A transcript makes this likelier, not less —
+    # a caller reading a court reference aloud is exactly how a non-PW code ends up
+    # in the field.
+    result.case_ref = _find_case_ref(text) or _find_case_ref(result.case_ref)
+    result.meeting_reference = (
+        _find_meeting_ref(text) or _find_meeting_ref(result.meeting_reference)
+    )
     return result
 
 
