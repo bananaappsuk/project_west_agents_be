@@ -33,6 +33,18 @@ _PLACEHOLDER_KEYS = {"", "dummy", "sk-dummy", "changeme", "none", "null"}
 _CASE_REF_RE = re.compile(r"\bPW-\d{4}-\d{3,}\b", re.IGNORECASE)
 _MEETING_REF_RE = re.compile(r"\bPW-M-\d{4,}\b", re.IGNORECASE)
 
+#: A referral the CRM has already created. The website posts a referral straight to
+#: the CRM, which then emails referrals@ to tell staff it happened — so that notice
+#: arrives in a monitored mailbox reading exactly like a referral request, because
+#: it quotes the whole form back.
+#:
+#: Submitting one as a new referral would create a second record for a family that
+#: already has one. That has not happened yet only because every referral was being
+#: rejected for an unrelated reason (a 152-character idempotency key against a
+#: 120-character limit); with that fixed, the next notice would have gone through.
+#: 9 of the 23 referrals that failed were these.
+_REFERRAL_REF_RE = re.compile(r"\bPW-R-\d{4}-\d{3,}\b", re.IGNORECASE)
+
 # The CRM's actual enums (app/core/enums.py: ReferralSource, ServiceType) — the
 # prompt must only offer values the CRM will accept, or a REFERRAL 422s outright.
 _REFERRER_TYPES = "SELF, LOCAL_AUTHORITY, CAFCASS, SOLICITOR, FAMILY_MEDIATION, COURT, OTHER"
@@ -131,6 +143,13 @@ def analyze_email(email: dict) -> MailAnalysis:
     result.meeting_reference = (
         _find_meeting_ref(text) or _find_meeting_ref(result.meeting_reference)
     )
+    # An email quoting a PW-R- reference is about a referral the CRM already holds,
+    # whatever it looks like. The CRM's own "new referral received" notice quotes the
+    # submitted form in full, so a classifier reading it sees a textbook referral
+    # request -- and forwarding that back would create a duplicate record for a real
+    # family. The reference is decisive: the CRM issued it, so the referral exists.
+    if result.intent == "REFERRAL" and _REFERRAL_REF_RE.search(text):
+        result.intent = "NONE"
     return result
 
 
@@ -260,6 +279,13 @@ def analyze_call(call: dict) -> CallAnalysis:
     result.meeting_reference = (
         _find_meeting_ref(text) or _find_meeting_ref(result.meeting_reference)
     )
+    # An email quoting a PW-R- reference is about a referral the CRM already holds,
+    # whatever it looks like. The CRM's own "new referral received" notice quotes the
+    # submitted form in full, so a classifier reading it sees a textbook referral
+    # request -- and forwarding that back would create a duplicate record for a real
+    # family. The reference is decisive: the CRM issued it, so the referral exists.
+    if result.intent == "REFERRAL" and _REFERRAL_REF_RE.search(text):
+        result.intent = "NONE"
     return result
 
 

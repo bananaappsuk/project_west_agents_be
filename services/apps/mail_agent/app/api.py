@@ -7,7 +7,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import crypto, graph_client, mail_client, pipeline
+from . import crypto, graph_client, mail_client, pipeline, sync
 from .config import settings
 from .db import get_session
 from .deps import mailbox_scope, require
@@ -151,34 +151,39 @@ async def list_emails(
 @router.post("/emails/fetch", status_code=status.HTTP_202_ACCEPTED)
 async def fetch_emails(
     background_tasks: BackgroundTasks,
-    count: int = 0,
-    full_resync: bool = False,
     scope: MailboxScope = Depends(mailbox_scope),
     claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)
 ):
-    """Kicks off a fetch+analyze run in the background and returns immediately —
-    a full sync can take minutes on a large mailbox (sequential LLM calls, 5 at a
-    time), far longer than any request should stay open. The mailbox check below
-    stays synchronous so the common failure case still surfaces immediately; the
-    slow work is what moved to the background. Poll GET /agent/status (its
-    `running` flag, and each history entry's live progress counters) to know how
-    it's going — that's real server state, so it stays correct no matter which
-    page you're on.
+    """Run the hourly sync now instead of waiting for the next tick.
 
-    `count=0` (the default) fetches *everything* not yet synced — a mailbox's
-    first-ever sync naturally gets its whole history this way, and every sync
-    after that only ever asks for what's actually new (see pipeline.py's sync
-    watermark), not a fixed per-run cap. `full_resync=True` ignores the stored
-    watermark and rescans the whole mailbox from the start — a recovery/audit
-    tool, not something a normal sync needs."""
-    mailbox = await session.scalar(select(Mailbox))
-    if not mailbox or not mailbox.enabled:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
+    Exactly what the scheduler runs — `sync.run_once`, across every approved
+    mailbox — so "sync now" and the cron cannot drift apart in behaviour.
 
+    It used to call `pipeline.fetch_and_process(count, sweep=True)`, which was
+    correct when one mailbox existed and dangerous once six did. That path picks a
+    single mailbox with a bare `select(Mailbox)`, so five of the six were never
+    collected; and `sweep=True` issues one unfiltered
+    `UPDATE emails SET archived_at = now()`, which would have emptied every queue
+    in the tenant — including the drafts waiting for approval — on one click.
+
+    Returns immediately: a run makes sequential LLM calls and takes far longer
+    than a request should stay open. Poll GET /agent/status for progress; that is
+    real server state, so it stays correct whichever page asked for the run.
+    """
+    if scope.is_empty:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "you are not authorised for any mailbox - ask IT to add you to the "
+            "relevant PW-Mailbox group",
+        )
     if pipeline.is_running():
         raise HTTPException(status.HTTP_409_CONFLICT, "a sync is already in progress")
 
-    background_tasks.add_task(pipeline.fetch_and_process, count, sweep=True, reset_watermark=full_resync)
+    # Deliberately not narrowed to the caller's mailboxes. A sync is a tenant-wide
+    # job the cron would run anyway; scoping it per user would mean the mail a
+    # colleague is waiting for depends on who happened to press the button. The
+    # scope check above is an authorisation gate, not a filter.
+    background_tasks.add_task(sync.run_once)
     return {"status": "started"}
 
 
