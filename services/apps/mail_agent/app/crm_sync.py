@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 
 from . import crm_client
@@ -41,9 +42,55 @@ _SERVICE_TYPES = {
 }
 
 
+#: The CRM's controlled safeguarding vocabulary (their enums; mirrored in
+#: agent_factory's prompt). A value outside this set is a 422 that loses the whole
+#: referral, so anything unrecognised is dropped and the rest still goes.
+_SAFEGUARDING_FLAGS = {
+    "domestic_abuse", "child_abuse_neglect", "substance_misuse", "mental_health",
+    "abduction_risk", "violence_or_aggression", "relevant_convictions",
+}
+
+#: A referral reference the CRM has already issued, quoted back at us in a reply —
+#: a family returning a completed Part 2, or a bounce for mail the CRM sent them.
+_REFERRAL_REF_RE = re.compile(r"\bPW-R-\d{4}-\d{3,}\b", re.IGNORECASE)
+
+
 def _enum_or_none(value: str, allowed: set[str]) -> str | None:
     v = (value or "").strip().upper()
     return v if v in allowed else None
+
+
+def _safeguarding_flags(values: list[str] | None) -> list[str]:
+    """Normalise to the CRM's vocabulary, dropping anything it would reject.
+
+    Their parser forgives casing and separators ("Domestic Abuse", "domestic-abuse"),
+    so normalise here rather than relying on it. An unknown value is dropped rather
+    than passed through: one bad entry 422s the entire referral, and losing a
+    referral is worse than losing one flag off it.
+
+    Deduplicated and ordered so the same email always produces the same payload.
+    """
+    out: set[str] = set()
+    for v in values or []:
+        norm = (v or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if norm in _SAFEGUARDING_FLAGS:
+            out.add(norm)
+    return sorted(out)
+
+
+def _referral_ref_in(*texts: str | None) -> str | None:
+    """The PW-R- reference an email quotes back, if any.
+
+    Carried on the activity log as `outcome_reference` so a completed Part 2 form or
+    a delivery failure reaches a coordinator attached to the referral it concerns,
+    rather than as an unlinked note. The CRM has no endpoint for either yet; this is
+    the shape they asked for in the meantime.
+    """
+    for t in texts:
+        m = _REFERRAL_REF_RE.search(t or "")
+        if m:
+            return m.group(0).upper()
+    return None
 
 
 def _idempotency_key(uid: str) -> str:
@@ -158,6 +205,10 @@ async def after_email_analysis(
                 "child_lives_with": analysis.get("child_lives_with") or None,
                 "requesting_adult_name": analysis.get("requesting_adult_name") or None,
                 "relationship_to_child": analysis.get("relationship_to_child") or None,
+                # Sets the case's risk level on conversion, so an omission files a
+                # real risk as routine. Validated rather than trusted: one value
+                # outside their list 422s the whole referral.
+                "safeguarding_flags": _safeguarding_flags(analysis.get("safeguarding_flags")),
                 "source_payload": {"raw_email_subject": subject, "thread_id": uid},
                 "attachments": uploaded,
             }
@@ -236,6 +287,16 @@ async def after_email_analysis(
         # all (crm_status="failed" is visible on our own side only) — so this
         # still logs an activity row, just as NO_ACTION, not a made-up value.
         outcome, outcome_reference, case_ref = "NO_ACTION", None, None
+
+    # A reply quoting a referral the CRM already issued — a family returning their
+    # completed Part 2, or a bounce for mail the CRM sent them. Neither has an
+    # endpoint yet, and both are invisible to the CRM otherwise: a bounce arrives
+    # after SMTP accepted the message, so their own records show it as delivered.
+    # Carrying the reference on the activity row is the shape the CRM asked for in
+    # the meantime, and it puts the item in front of a coordinator attached to the
+    # referral it concerns rather than as an unlinked note.
+    if outcome_reference is None:
+        outcome_reference = _referral_ref_in(subject, email_payload.get("body"))
 
     activity_ref = await _log_activity(
         occurred_at=occurred_at, summary=summary, outcome=outcome,

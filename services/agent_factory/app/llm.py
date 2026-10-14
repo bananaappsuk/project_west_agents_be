@@ -48,6 +48,25 @@ _REFERRAL_REF_RE = re.compile(r"\bPW-R-\d{4}-\d{3,}\b", re.IGNORECASE)
 # The CRM's actual enums (app/core/enums.py: ReferralSource, ServiceType) — the
 # prompt must only offer values the CRM will accept, or a REFERRAL 422s outright.
 _REFERRER_TYPES = "SELF, LOCAL_AUTHORITY, CAFCASS, SOLICITOR, FAMILY_MEDIATION, COURT, OTHER"
+
+#: The CRM's controlled safeguarding vocabulary. Not decoration: on conversion the
+#: first three set the case's risk level to HIGH, the rest to MEDIUM, and none at
+#: all to LOW. Every referral we have sent so far converted at LOW, including the
+#: fifteen our own classifier had marked as a safeguarding concern, because this
+#: field was never populated.
+#:
+#: A value outside the list is a 422 rather than a silent downgrade — deliberate on
+#: their side, since an unrecognised flag would never match their high-risk set and
+#: a real abduction risk would quietly file as routine.
+_SAFEGUARDING_FLAGS = (
+    "domestic_abuse",
+    "child_abuse_neglect",
+    "substance_misuse",
+    "mental_health",
+    "abduction_risk",
+    "violence_or_aggression",
+    "relevant_convictions",
+)
 _SERVICE_TYPES = (
     "SUPERVISED_FAMILY_TIME, SUPPORTED_FAMILY_TIME, COMMUNITY_FAMILY_TIME, "
     "VIRTUAL_FAMILY_TIME, FAMILY_TIME_HANDOVER, INDIRECT_FAMILY_TIME, "
@@ -106,6 +125,13 @@ class CrmFields(BaseModel):
     child_lives_with: str = Field(default="", description="Who the child currently lives with, only for REFERRAL")
     requesting_adult_name: str = Field(default="", description="Name of the requesting adult, only for REFERRAL")
     relationship_to_child: str = Field(default="", description="The requesting adult's relationship to the child, only for REFERRAL")
+    safeguarding_flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Specific safeguarding risks stated or implied, from the controlled list, "
+            "only for REFERRAL. Empty list when none apply."
+        ),
+    )
 
 
 class MailAnalysis(CrmFields):
@@ -183,6 +209,11 @@ def _analyze_llm(email: dict) -> MailAnalysis:
         f"service_requested (one of: {_SERVICE_TYPES}), help_needed, children, "
         "child_lives_with, requesting_adult_name, relationship_to_child from what is "
         "explicitly stated — leave any you can't find blank.\n"
+        f"  Also set safeguarding_flags to every one of these that the message states or "
+        f"clearly implies, as an empty list when none do: {', '.join(_SAFEGUARDING_FLAGS)}. "
+        "These set the case's risk level, so err toward including one: a flag raised in "
+        "error is reviewed by a person, a flag missed is not. Use only these exact "
+        "values.\n"
         "- CASE_COMMUNICATION: an update, question, or general contact about an existing "
         "case (a case reference like PW-2026-0001 may be quoted).\n"
         "- RESCHEDULE: asking to move a session/appointment to a different time. Also set "
