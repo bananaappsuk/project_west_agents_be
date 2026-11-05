@@ -14,6 +14,13 @@ class Settings(BaseServiceSettings):
     cron_tick_minutes: int = 5    # how often the scheduler checks each org's schedule
     fetch_per_run: int = 20
 
+    # How often the workflow sweep runs (retry of scheduled steps, recovery of
+    # runs abandoned by a dead worker). Separate from cron_tick_minutes because a
+    # reply whose send hit a transient failure should retry in minutes regardless
+    # of whether the mail fetch interval is hourly or daily. Shares CRON_ENABLED
+    # as its master switch -- there is one background scheduler, not two.
+    workflow_tick_minutes: int = 2
+
     # CRM intake (pw-crm-be) — referrals, case communications, session change requests.
     # Off by default so environments without real CRM credentials never call out.
     crm_enabled: bool = False

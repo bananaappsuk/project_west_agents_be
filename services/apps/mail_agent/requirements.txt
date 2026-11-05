@@ -10,3 +10,9 @@ apscheduler>=3.10
 msal>=1.28
 requests>=2.31
 nh3>=0.2
+# Shared workflow orchestration (lifecycle, routing, approval, retry,
+# audit). Editable local dependency, same arrangement as platform_common:
+# the canonical source is libs/, and services/apps/mail_agent carries the
+# vendored copy this service deploys with (scripts/sync_shared_libs.py
+# keeps them identical; a test in tests/ fails if they drift).
+-e ../../../libs/platform_orchestration

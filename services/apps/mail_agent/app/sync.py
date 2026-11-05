@@ -123,19 +123,13 @@ async def run_once(*, analyse: bool = True, analyse_limit: int = 50) -> SyncRepo
         return report
 
     try:
+        # No send credentials passed: auto-sending goes through the
+        # `mail.auto_reply` workflow, which resolves the sending mailbox from the
+        # email being answered. This call site used to pass `"mailbox": ""`, which
+        # could not have sent anything from this path at all.
         ok, high, _all_ok = await pipeline.analyze_and_persist(
             payloads,
             auto_reply_enabled=auto_reply,
-            # Send credentials are now deployment configuration rather than a
-            # per-mailbox row. The physical mailbox a reply goes out from is
-            # resolved per email by send_identity.derive, not fixed here.
-            send_creds={
-                "tenant_id": settings.graph_tenant_id,
-                "client_id": settings.graph_client_id,
-                "client_secret": settings.graph_client_secret,
-                "mailbox": "",
-            },
-            provider="graph",
         )
         report.analysed, report.high_priority = ok, high
     except Exception as exc:  # noqa: BLE001 - a failed analysis must not lose captures

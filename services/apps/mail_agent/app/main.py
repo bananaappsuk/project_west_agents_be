@@ -9,7 +9,9 @@ from platform_common import configure_logging
 configure_logging("mail_agent")
 log = logging.getLogger("mail_agent")
 
-from . import api, scheduler  # noqa: E402  (import after logging is configured)
+from platform_orchestration.models import OrchestrationBase  # noqa: E402
+
+from . import api, scheduler, workflow_api  # noqa: E402  (import after logging is configured)
 from .db import engine
 from .models import Base
 
@@ -20,6 +22,11 @@ async def _init_db(retries: int = 6, delay: float = 2.0) -> None:
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+                # The shared orchestration tables live in this service's own
+                # database, on their own metadata -- the library does not reach
+                # into this service's declarative base. Created here alongside
+                # everything else, matching the MVP's create_all approach.
+                await conn.run_sync(OrchestrationBase.metadata.create_all)
             return
         except Exception as exc:
             log.warning("DB connect attempt %d/%d failed: %s", attempt, retries, exc)
@@ -41,3 +48,4 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="mail-agent", version="0.1.0", lifespan=lifespan)
 app.include_router(api.router)
+app.include_router(workflow_api.router)

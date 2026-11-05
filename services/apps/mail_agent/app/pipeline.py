@@ -44,8 +44,14 @@ log = logging.getLogger("mail_agent.pipeline")
 
 
 def _send_fn_for(provider: str):
-    """Which client actually delivers a reply — shared by the auto-send path
-    below and api.py's manual "Reply" button, so both make the same choice.
+    """Which client actually delivers a reply.
+
+    Called from exactly one place: the `mail.send_reply` step handler in
+    orchestration.py, which is the only code path that may send at all (see
+    DECISIONS.md D10). It stays here rather than moving there because the choice
+    is about this service's transport configuration, not about the workflow, and
+    `test_no_ungated_send.py` asserts the single caller.
+
     Graph orgs always send via Graph (HTTP, already unaffected). IMAP orgs send
     via SendGrid's HTTP API instead of raw SMTP when configured, since raw SMTP
     can't succeed on a platform that doesn't route outbound SMTP traffic at all
@@ -118,31 +124,24 @@ def is_running() -> bool:
     return _running
 
 
-async def load_send_context() -> tuple[dict, str, bool] | None:
-    """Send creds (shape depends on provider — Graph reuses its read creds,
-    IMAP orgs get SMTP creds) + the org's auto-reply setting — everything an
-    analysis pass needs besides the emails themselves. Returns None if no
-    mailbox is set up."""
+async def load_reply_policy() -> bool | None:
+    """The org's auto-reply setting, or None if no mailbox is set up yet.
+
+    This used to hand back send credentials as well, decrypting a mailbox secret
+    on every analysis pass. It no longer needs to: auto-sending goes through the
+    `mail.auto_reply` workflow (see orchestration.py), which resolves the mailbox
+    and its credentials for the one email it is actually sending. Fewer places
+    decrypting a stored secret is worth more than the query it saved.
+
+    None still means "not configured", which callers turn into their own error --
+    an analysis pass with no mailbox is a misconfiguration, not an empty result.
+    """
     async with SessionLocal() as s:
         mailbox = await s.scalar(select(Mailbox))
         if not mailbox:
             return None
-        if mailbox.provider == "graph":
-            send_creds = {
-                "tenant_id": mailbox.tenant_id,
-                "client_id": mailbox.client_id,
-                "client_secret": crypto.decrypt(mailbox.client_secret_enc),
-                "mailbox": mailbox.username,
-            }
-        else:
-            send_creds = {
-                "smtp_host": mailbox.smtp_host,
-                "smtp_port": mailbox.smtp_port,
-                "username": mailbox.username,
-                "password": crypto.decrypt(mailbox.password_enc),
-            }
         cfg = await s.scalar(select(AgentConfig))
-        return send_creds, mailbox.provider, bool(cfg and cfg.auto_reply_enabled)
+        return bool(cfg and cfg.auto_reply_enabled)
 
 
 async def _select_for_analysis(limit: int) -> list[tuple[str, dict]]:
@@ -180,7 +179,7 @@ async def _count_skipped() -> int:
 
 
 async def analyze_and_persist(
-    rows: list[tuple[str, dict]], *, auto_reply_enabled: bool, send_creds: dict, provider: str,
+    rows: list[tuple[str, dict]], *, auto_reply_enabled: bool,
     sem: asyncio.Semaphore | None = None, attachments_by_id: dict[str, list[dict]] | None = None,
 ) -> tuple[int, int, bool]:
     """Analyzes + persists a batch of (email_id, payload) pairs — the shared
@@ -234,7 +233,6 @@ async def analyze_and_persist(
         # serialized payloads already carry fromEmail/subject, so this needs no
         # extra DB read.
         payload_by_id = {eid: p for eid, p in rows}
-        send_fn = _send_fn_for(provider)
 
         # Which of this batch are already restricted from the address they ARRIVED
         # at. Read once, outside the send loop, so no DB connection is held across a
@@ -263,12 +261,24 @@ async def analyze_and_persist(
             payload = payload_by_id[email_id]
             async with sem:
                 try:
-                    await run_in_threadpool(
-                        send_fn,
-                        **send_creds, to_addr=payload["fromEmail"],
-                        subject=f"Re: {payload['subject']}", body=a.get("suggested_reply", "") or "",
+                    # Through the orchestration workflow, not straight out of the
+                    # door: the org's auto-reply setting is recorded as the
+                    # authority for this send, the run is idempotent per email, and
+                    # the attempt is audited either way. The eligibility decisions
+                    # above are unchanged and still this function's own — the
+                    # workflow applies its safeguarding checks on top of them.
+                    #
+                    # Imported here rather than at module scope because
+                    # `orchestration` imports this module for `_send_fn_for`.
+                    from . import orchestration
+
+                    sent = await orchestration.auto_send_reply(
+                        email_id, body=a.get("suggested_reply", "") or "",
                     )
-                    return email_id, a, ok, True
+                    if not sent:
+                        log.info("auto-send did not complete uid=%s — falling back to draft",
+                                 payload.get("uid"))
+                    return email_id, a, ok, sent
                 except Exception as exc:
                     log.warning("auto-send FAILED uid=%s: %s — falling back to draft", payload.get("uid"), exc)
                     return email_id, a, ok, False
@@ -331,6 +341,13 @@ async def analyze_and_persist(
                         e.draft_reply = suggested_reply
                         e.reply_status = "sent"
                         e.auto_sent = True
+                    elif e.reply_status == "pending":
+                        # A reply is already queued for approval and someone is
+                        # deciding on it. Overwriting the status would show them a
+                        # plain draft for a message that is actually waiting on a
+                        # release, and overwriting the body would change the text
+                        # they are being asked to approve. Keep both.
+                        pass
                     else:
                         # Either not auto-sendable (needs a human), or the send
                         # attempt itself failed — either way, land it as a draft
@@ -361,14 +378,13 @@ async def analyze_backlog(count: int = _BACKLOG_ANALYZE_DEFAULT) -> dict:
         raise RuntimeError("a sync/analyze is already in progress")
     _running = True
     try:
-        ctx = await load_send_context()
-        if ctx is None:
+        auto_reply_enabled = await load_reply_policy()
+        if auto_reply_enabled is None:
             raise LookupError("no mailbox configured for this org")
-        send_creds, provider, auto_reply_enabled = ctx
 
         rows = await _select_for_analysis(count)
         ok, high, all_ok = await analyze_and_persist(
-            rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider,
+            rows, auto_reply_enabled=auto_reply_enabled,
         )
         remaining = await _count_skipped()
         log.info("analyze_backlog: analyzed=%d high=%d remaining=%d all_ok=%s", ok, high, remaining, all_ok)
@@ -471,16 +487,9 @@ async def _run(count: int, sweep: bool, reset_watermark: bool, run_id: str) -> l
                 "username": mailbox.username,
                 "password": crypto.decrypt(mailbox.password_enc),
             }
-        # Send creds for the possible auto-send branch below — read once here so
-        # a high-confidence, non-sensitive reply can go out without a second query.
-        # Graph mode sends through the same app registration it reads with, so
-        # this just reuses `creds` rather than decrypting a second secret.
-        send_creds = creds if provider == "graph" else {
-            "smtp_host": mailbox.smtp_host,
-            "smtp_port": mailbox.smtp_port,
-            "username": mailbox.username,
-            "password": crypto.decrypt(mailbox.password_enc),
-        }
+        # No send credentials are read here any more. The auto-send branch below
+        # went through the orchestration workflow, which resolves the sending
+        # mailbox per email rather than fixing one for the whole run.
         cfg = await s.scalar(select(AgentConfig))
         auto_reply_enabled = bool(cfg and cfg.auto_reply_enabled)
 
@@ -652,7 +661,7 @@ async def _run(count: int, sweep: bool, reset_watermark: bool, run_id: str) -> l
     # --- analysis phase: summarize only the most recent slice, once, after import ---
     rows = await _select_for_analysis(_AUTO_ANALYZE_COUNT)
     _, high, all_ok = await analyze_and_persist(
-        rows, auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider, sem=sem,
+        rows, auto_reply_enabled=auto_reply_enabled, sem=sem,
         attachments_by_id=attachments_by_id,
     )
 

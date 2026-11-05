@@ -1,0 +1,96 @@
+[project]
+name = "platform-orchestration"
+version = "0.1.0"
+description = "Shared workflow orchestration foundation: lifecycle, routing, approval, retry, audit."
+requires-python = ">=3.10"
+dependencies = [
+    "platform-common",
+]
+
+[project.optional-dependencies]
+# The SQLAlchemy-backed repository only. The engine core and the in-memory
+# repository import nothing from here, so a capability service that does not
+# persist workflows (or a test suite) needs none of it.
+sql = ["sqlalchemy[asyncio]>=2.0"]
+
+# The checks. An extra rather than an entry in a service's requirements.txt,
+# because those are deployment manifests and a linter has no business being
+# installed in production. Declared here so the versions the code was actually
+# checked against are recorded somewhere, which is more than the repo had before:
+# pytest is not declared anywhere either and has always been installed by hand.
+#
+#   services/apps/mail_agent/.venv/Scripts/python -m pip install #       -e libs/platform_orchestration[dev]
+dev = [
+    "ruff>=0.17",
+    "mypy>=1.11",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["platform_orchestration*"]
+
+# ── checks ───────────────────────────────────────────────────────────────────
+# Configured here, on the library, rather than at the backend root. A root config
+# would also govern five existing services whose code was never written against
+# it, so running it would report hundreds of pre-existing findings and the check
+# would be ignored from its first run. The mail agent's new modules are checked
+# with the same rules by passing them on the command line (see DECISIONS.md).
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/F/W catch real defects (undefined names, unused imports, broken syntax).
+# I keeps import order stable so a diff shows intent rather than churn.
+# B is the bug-shaped subset of flake8-bugbear; UP keeps us off deprecated typing.
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    # FastAPI's entire dependency-injection idiom is a call in a default
+    # argument. Honouring this rule would mean rewriting every route signature
+    # in the repo to work around a framework's documented API.
+    "B008",
+    # `"%s" % x` throughout. This repo formats with % consistently, including in
+    # every logging call, where it is the correct form because logging defers
+    # interpolation. Enforcing f-strings here would split the codebase in two
+    # styles to no benefit.
+    "UP031",
+    # Suggests `enum.StrEnum`, which is 3.11+. This service runs on 3.10.
+    "UP042",
+]
+
+[tool.ruff.lint.isort]
+# Stated rather than inferred. Ruff decides first-party by looking at the
+# directory it was invoked from, so the same file sorted clean from inside the
+# library and dirty from the backend root. Naming the package makes the check
+# give one answer wherever it is run -- including from the mail agent, which
+# borrows this config.
+known-first-party = ["platform_orchestration"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on long literal strings and import fixtures by name.
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["platform_orchestration"]
+# Deliberately not --strict. The value here is catching real contradictions --
+# a None flowing into a non-optional parameter, a protocol a class does not
+# satisfy -- not annotating every local. A check nobody can pass gets switched
+# off; this one has to stay runnable.
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Optional extra: a host that does not persist workflows never installs it.
+module = ["sqlalchemy.*"]
+ignore_missing_imports = true

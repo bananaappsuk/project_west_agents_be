@@ -7,7 +7,9 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import crypto, graph_client, mail_client, pipeline, sync
+from platform_orchestration import NotAuthorized, WorkflowState
+
+from . import crypto, graph_client, mail_client, orchestration, pipeline, sync
 from .config import settings
 from .db import get_session
 from .deps import mailbox_scope, require
@@ -240,44 +242,85 @@ async def generate_drafts(body: IdsIn, claims: dict = Depends(require(WRITE)), s
 @router.post("/emails/{email_id}/reply/dismiss", status_code=status.HTTP_204_NO_CONTENT)
 async def dismiss_reply(email_id: str, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
     """Human-in-the-loop reject: the AI's draft isn't wanted. The draft stays on
-    the row (for audit) but reply_status flips so it drops out of the review queue."""
+    the row (for audit) but reply_status flips so it drops out of the review queue.
+
+    Also rejects the approval run, if one is open. Otherwise dismissing a reply
+    that had already been queued would leave the run sitting in the workflow
+    review queue for someone else to approve -- the decision would have been taken
+    and the gate would not know it.
+    """
     e = await _get_email(session, email_id, scope)
     e.reply_status = "rejected"
     await session.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.post("/emails/{email_id}/reply", status_code=status.HTTP_204_NO_CONTENT)
-async def send_reply(email_id: str, body: ReplyIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
-    e = await _get_email(session, email_id, scope)
-    mailbox = await session.scalar(select(Mailbox))
-    if not mailbox:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
-    send_fn = pipeline._send_fn_for(mailbox.provider)
-    send_creds = (
-        {
-            "tenant_id": mailbox.tenant_id,
-            "client_id": mailbox.client_id,
-            "client_secret": crypto.decrypt(mailbox.client_secret_enc),
-            "mailbox": mailbox.username,
-        }
-        if mailbox.provider == "graph"
-        else {
-            "smtp_host": mailbox.smtp_host,
-            "smtp_port": mailbox.smtp_port,
-            "username": mailbox.username,
-            "password": crypto.decrypt(mailbox.password_enc),
-        }
+    await orchestration.reject_open_run(
+        email_id=email_id,
+        principal=orchestration.principal_from_claims(claims),
+        scope=scope,
+        note="dismissed from the email review screen",
     )
-    try:
-        await run_in_threadpool(
-            send_fn, **send_creds, to_addr=e.from_email, subject=f"Re: {e.subject}", body=body.body,
-        )
-    except Exception as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"send failed: {exc}") from exc
-    e.reply_status = "sent"
-    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/emails/{email_id}/reply", status_code=status.HTTP_202_ACCEPTED)
+async def send_reply(email_id: str, body: ReplyIn, claims: dict = Depends(require(WRITE)), scope: MailboxScope = Depends(mailbox_scope), session: AsyncSession = Depends(get_session)):
+    """Submit a reply for approval. This route no longer sends.
+
+    It used to: it took a body and put it on the wire, so anyone holding
+    `emails.write` plus `can_send` released outbound mail with no approval record
+    and no audit row. The approval workflow exists to be the record of who
+    authorised a send, and an alternative route around it would have made that
+    record optional, which is the same as not having it.
+
+    So the semantics changed rather than the path: the same call now queues the
+    reply and stops at the approval gate. Releasing it takes the `can_approve`
+    grant on the mailbox -- a separate axis from `can_send`, already resolved by
+    `mailbox_scope` -- through `POST /workflows/{run_id}/approve`.
+
+    The path is kept (rather than removed in favour of
+    `POST /workflows/reply-approval`) because it is what the deployed frontend
+    calls, and a 404 there would break the review screen for anyone on a cached
+    bundle. The two routes share one implementation, so neither can drift into a
+    weaker rule than the other.
+
+    202, not 204: something was accepted for later, which is exactly what the
+    status code is for, and the body carries the run the caller now polls or
+    approves.
+    """
+    e = await _get_email(session, email_id, scope)
+
+    try:
+        run = await orchestration.submit_for_approval(
+            email_id=email_id,
+            body=body.body,
+            principal=orchestration.principal_from_claims(claims),
+            scope=scope,
+        )
+    except NotAuthorized:
+        # Consistent with _get_email: the caller must not learn whether an email
+        # they cannot act on exists.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found") from None
+
+    if run.state is not WorkflowState.AWAITING_APPROVAL:
+        # `prepare` refused -- restricted material, a forbidden alias, no mailbox,
+        # a reply already sent. The reason is a stable `send_identity` code the UI
+        # maps to prose, and the refusal is on the run's audit trail either way.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            run.last_error or "this reply cannot be sent",
+        )
+
+    # Distinct from "draft": a draft is waiting for someone to look at it, this is
+    # waiting for someone to release it. The review UI needs to tell them apart.
+    e.reply_status = "pending"
+    if body.body:
+        e.draft_reply = body.body
+    await session.commit()
+
+    return {
+        "runId": run.id,
+        "state": run.state.value,
+        "replyStatus": e.reply_status,
+    }
 
 
 @router.post("/emails/{email_id}/retry-summary")
@@ -301,12 +344,11 @@ async def retry_summary(email_id: str, claims: dict = Depends(require(WRITE)), s
     payload = serialize_email(e)
     await session.commit()
 
-    ctx = await pipeline.load_send_context()
-    if ctx is None:
+    auto_reply_enabled = await pipeline.load_reply_policy()
+    if auto_reply_enabled is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no mailbox configured")
-    send_creds, provider, auto_reply_enabled = ctx
     await pipeline.analyze_and_persist(
-        [(email_id, payload)], auto_reply_enabled=auto_reply_enabled, send_creds=send_creds, provider=provider,
+        [(email_id, payload)], auto_reply_enabled=auto_reply_enabled,
     )
 
     await session.refresh(e)

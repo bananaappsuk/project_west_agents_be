@@ -14,7 +14,9 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import func, select
 
-from . import pipeline, sync
+from platform_orchestration import SYSTEM_PRINCIPAL
+
+from . import orchestration, pipeline, sync
 from .config import settings
 from .db import SessionLocal
 from .models import AgentConfig, AgentRun, Mailbox
@@ -84,14 +86,67 @@ async def _tick() -> None:
         log.exception("cron run FAILED")
 
 
+async def _workflow_tick() -> None:
+    """Advance workflows that are waiting on the clock rather than on a person.
+
+    Two sweeps, in this order:
+
+      * `recover_stale` reclaims runs abandoned mid-step by a worker that died.
+        A lapsed lease means no process is working on the run any more, so it is
+        put back to `retry_scheduled` -- which keeps one code path for "try this
+        step again" rather than a second, less-tested one for crash recovery.
+      * `resume_due` then advances everything whose retry time has arrived,
+        including what the first sweep just rescheduled.
+      * `resume_policy_gated` releases autonomous replies parked at their policy
+        gate with nothing left to approve them. Neither sweep above reaches a
+        run in `awaiting_approval`, which is right for a run waiting on a person
+        and wrong for one waiting on the org's auto-reply setting: the authority
+        already exists, so a process that died between starting the run and
+        approving it would otherwise strand it forever.
+
+    Runs under the system principal, which the engine refuses the *human*
+    approval path to outright -- so this tick can drive a workflow up to a human
+    gate and never through one. `resume_policy_gated` is scoped to
+    `mail.auto_reply`, whose send step opted in with `policy_approval=True`;
+    a `mail.reply_approval` run waiting for a reviewer is untouched by all three.
+    """
+    orch = orchestration.build_orchestrator(
+        orchestration.SystemAuthorizationPort()
+    )
+    try:
+        recovered = await orch.recover_stale(principal=SYSTEM_PRINCIPAL)
+        resumed = await orch.resume_due(principal=SYSTEM_PRINCIPAL)
+        released = await orch.resume_policy_gated(
+            principal=SYSTEM_PRINCIPAL,
+            policy=orchestration.AUTO_REPLY_POLICY,
+            definition=orchestration.AUTO_REPLY,
+        )
+    except Exception:
+        # A failing sweep must not kill the scheduler job; the next tick retries.
+        log.exception("workflow sweep FAILED")
+        return
+    if recovered or resumed or released:
+        log.info("workflow sweep — %d recovered, %d resumed, %d policy-released",
+                 len(recovered), len(resumed), len(released))
+
+
 def start() -> None:
     if not settings.cron_enabled:
         log.info("CRON_ENABLED=false — scheduler NOT started")
         return
     scheduler.add_job(_tick, "interval", minutes=settings.cron_tick_minutes,
                       id="mail_cron_tick", replace_existing=True)
+    # A separate job from the mail sync, on its own schedule. Workflow recovery
+    # must not wait on the fetch interval (which can be hourly or daily): a reply
+    # whose send hit a transient failure should retry in minutes, and tying it to
+    # the sync would also mean a long-running fetch delayed every pending retry.
+    scheduler.add_job(_workflow_tick, "interval",
+                      minutes=settings.workflow_tick_minutes,
+                      id="mail_workflow_tick", replace_existing=True)
     scheduler.start()
-    log.info("cron scheduler started — tick every %d min", settings.cron_tick_minutes)
+    log.info("cron scheduler started — mail tick every %d min, "
+             "workflow tick every %d min",
+             settings.cron_tick_minutes, settings.workflow_tick_minutes)
 
 
 def stop() -> None:

@@ -75,7 +75,11 @@ class Email(Base):
     read: Mapped[bool] = mapped_column(Boolean, default=False)
     draft_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
     summary_status: Mapped[str] = mapped_column(String, default="pending")  # pending|done|failed
-    reply_status: Mapped[str] = mapped_column(String, default="none")       # none|draft|sent|rejected
+    # none|draft|pending|sent|rejected. "pending" means a reply has been queued
+    # for approval (mail.reply_approval) and is waiting for someone with the
+    # can_approve grant to release it -- distinct from "draft", which is waiting
+    # for someone to look at it. Nothing can send from either state on its own.
+    reply_status: Mapped[str] = mapped_column(String, default="none")
     auto_sent: Mapped[bool] = mapped_column(Boolean, default=False)         # sent by the AI, not a human
     # CRM intake (pw-crm-be) outcome for this email's detected intent, if any.
     intent: Mapped[str] = mapped_column(String, default="NONE")  # REFERRAL|CASE_COMMUNICATION|RESCHEDULE|CANCEL|NONE
