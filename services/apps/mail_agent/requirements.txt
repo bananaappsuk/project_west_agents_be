@@ -11,8 +11,13 @@ msal>=1.28
 requests>=2.31
 nh3>=0.2
 # Shared workflow orchestration (lifecycle, routing, approval, retry,
-# audit). Editable local dependency, same arrangement as platform_common:
-# the canonical source is libs/, and services/apps/mail_agent carries the
-# vendored copy this service deploys with (scripts/sync_shared_libs.py
-# keeps them identical; a test in tests/ fails if they drift).
--e ../../../libs/platform_orchestration
+# audit) is vendored into this service directory, the same arrangement as
+# platform_common, and so needs no entry here: the canonical source is
+# libs/, scripts/sync_shared_libs.py keeps the vendored copy identical, and
+# test_workflow_route_scope.py fails if the two drift.
+#
+# It must NOT be declared as `-e ../../../libs/platform_orchestration`. The
+# deploy builds this service with its own directory as the build root, where
+# that path does not exist, so pip cannot resolve it and the image never
+# builds. platform_common has never carried such an entry for the same
+# reason.
