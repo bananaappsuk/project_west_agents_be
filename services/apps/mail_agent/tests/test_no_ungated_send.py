@@ -18,6 +18,7 @@ import inspect
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 from app import api, orchestration, pipeline, send_identity
 from app.mailbox_scope import MailboxScope
@@ -520,15 +521,35 @@ def _const_name(value: str) -> str:
 # Configuration faults surface as refusals, not crashes
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _approve(result):
+    orch = orchestration.build_orchestrator(
+        orchestration.MailboxAuthorizationPort(scope())
+    )
+    return await orch.approve_and_continue(
+        result["runId"],
+        principal=orchestration.principal_from_claims(CLAIMS),
+        approved=True,
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_mailbox_with_no_credential_fails_the_step_rather_than_the_run(
-    store, email_factory, mailbox_factory, patched_sessions, workflow_store, sent
+async def test_a_mailbox_with_no_row_credentials_uses_the_deployment_config(
+    store, email_factory, mailbox_factory, patched_sessions, workflow_store, sent,
+    monkeypatch,
 ):
-    """mypy found this: `client_secret_enc` is nullable, so a Graph mailbox can
-    legitimately have no secret. Letting `None` reach Fernet would raise from
-    inside the crypto library and park the run on an unreadable error."""
+    """Found end to end, not by a test: every PW mailbox row carries an empty
+    `client_secret_enc`, because one app registration holds the Mail.Send grant
+    for all of them -- which is already how `sync.py` authenticates when it
+    ingests. Reading only the row made every approved reply fail with "no client
+    secret", so the gate queued replies it could never release."""
+    monkeypatch.setattr(orchestration.settings, "graph_tenant_id", "t-deploy")
+    monkeypatch.setattr(orchestration.settings, "graph_client_id", "c-deploy")
+    monkeypatch.setattr(orchestration.settings, "graph_client_secret", "s-deploy")
+
     mailbox = mailbox_factory()
     mailbox.client_secret_enc = None
+    mailbox.tenant_id = None
+    mailbox.client_id = None
     store.put(email_factory())
     store.put(mailbox)
 
@@ -536,17 +557,120 @@ async def test_a_mailbox_with_no_credential_fails_the_step_rather_than_the_run(
         "email-1", api.ReplyIn(body="Thanks."),
         claims=CLAIMS, scope=scope(), session=store(),
     )
-    orch = orchestration.build_orchestrator(
-        orchestration.MailboxAuthorizationPort(scope())
+    run = await _approve(result)
+
+    assert run.state is S.SUCCEEDED, run.last_error
+    assert len(sent) == 1, "the reply should have gone out on the deployment creds"
+
+
+@pytest.mark.asyncio
+async def test_a_send_with_no_credentials_anywhere_fails_the_step_not_the_run(
+    store, email_factory, mailbox_factory, patched_sessions, workflow_store, sent,
+    monkeypatch,
+):
+    """The original guard, still required. `client_secret_enc` is nullable, so
+    letting `None` reach Fernet would raise from inside the crypto library and
+    park the run on an unreadable error. Now that deployment config is a second
+    source, a refusal means neither source had anything."""
+    monkeypatch.setattr(orchestration.settings, "graph_tenant_id", None)
+    monkeypatch.setattr(orchestration.settings, "graph_client_id", None)
+    monkeypatch.setattr(orchestration.settings, "graph_client_secret", None)
+
+    mailbox = mailbox_factory()
+    mailbox.client_secret_enc = None
+    mailbox.tenant_id = None
+    mailbox.client_id = None
+    store.put(email_factory())
+    store.put(mailbox)
+
+    result = await api.send_reply(
+        "email-1", api.ReplyIn(body="Thanks."),
+        claims=CLAIMS, scope=scope(), session=store(),
     )
-    run = await orch.approve_and_continue(
-        result["runId"],
-        principal=orchestration.principal_from_claims(CLAIMS),
-        approved=True,
-    )
+    run = await _approve(result)
+
     assert run.state is S.FAILED
-    assert "no client secret" in (run.last_error or "")
+    assert "no Graph credentials are available" in (run.last_error or "")
     assert sent == []
+    # And the email must not be stranded. The review queue lists only runs in
+    # `awaiting_approval`, so leaving the row at "pending" showed "Awaiting
+    # approval" on a reply with no run left to approve or withdraw.
+    assert store.first("Email").reply_status == "draft", (
+        "a permanently failed send left the email stuck awaiting an approval "
+        "that can never happen"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reply_can_be_queued_again_after_a_send_failed(
+    store, email_factory, mailbox_factory, patched_sessions, workflow_store, sent,
+    monkeypatch,
+):
+    """Found end to end. The idempotency key was the email id, so the run that
+    failed owned that key for good: every later attempt was answered with the
+    stale failed run instead of a fresh one, and the reply could never be sent
+    even once the configuration was fixed."""
+    monkeypatch.setattr(orchestration.settings, "graph_tenant_id", None)
+    monkeypatch.setattr(orchestration.settings, "graph_client_id", None)
+    monkeypatch.setattr(orchestration.settings, "graph_client_secret", None)
+    mailbox = mailbox_factory()
+    mailbox.client_secret_enc = None
+    mailbox.tenant_id = None
+    mailbox.client_id = None
+    store.put(email_factory())
+    store.put(mailbox)
+
+    first = await api.send_reply(
+        "email-1", api.ReplyIn(body="Thanks."),
+        claims=CLAIMS, scope=scope(), session=store(),
+    )
+    failed = await _approve(first)
+    assert failed.state is S.FAILED
+
+    # The configuration is fixed; the same reply must now be queueable.
+    monkeypatch.setattr(orchestration.settings, "graph_tenant_id", "t")
+    monkeypatch.setattr(orchestration.settings, "graph_client_id", "c")
+    monkeypatch.setattr(orchestration.settings, "graph_client_secret", "s")
+
+    second = await api.send_reply(
+        "email-1", api.ReplyIn(body="Thanks."),
+        claims=CLAIMS, scope=scope(), session=store(),
+    )
+    assert second["runId"] != first["runId"], (
+        "the failed run was handed back again, so the reply can never be sent"
+    )
+    run = await _approve(second)
+    assert run.state is S.SUCCEEDED, run.last_error
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_was_sent_is_not_queued_a_second_time(
+    store, email_factory, mailbox_factory, patched_sessions, workflow_store, sent
+):
+    """The other half of the same rule, and the reason the key exists at all. A
+    succeeded run keeps its key, so asking again returns that run rather than
+    sending the same reply to the same person twice."""
+    store.put(email_factory())
+    store.put(mailbox_factory())
+
+    first = await api.send_reply(
+        "email-1", api.ReplyIn(body="Thanks."),
+        claims=CLAIMS, scope=scope(), session=store(),
+    )
+    run = await _approve(first)
+    assert run.state is S.SUCCEEDED
+    assert len(sent) == 1
+
+    # The succeeded run keeps the key, so the second attempt resolves to it and
+    # the route refuses: it is not waiting for anyone's approval, it is done.
+    with pytest.raises(HTTPException) as caught:
+        await api.send_reply(
+            "email-1", api.ReplyIn(body="Thanks."),
+            claims=CLAIMS, scope=scope(), session=store(),
+        )
+    assert caught.value.status_code == 422
+    assert len(sent) == 1, "the reply went out twice"
 
 
 @pytest.mark.asyncio

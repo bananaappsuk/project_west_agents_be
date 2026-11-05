@@ -79,6 +79,7 @@ from platform_orchestration.errors import (
 from platform_orchestration.sql import SqlAuditSink, SqlWorkflowRepository
 
 from . import crypto, pipeline, receiving_address, restriction, send_identity
+from .config import settings
 from .db import SessionLocal
 from .mailbox_scope import MailboxScope
 from .models import Email, EmailAudit, Mailbox, MailboxAlias
@@ -295,6 +296,26 @@ async def prepare_reply(ctx) -> StepResult:
         )
 
 
+async def _release_from_pending(session, email_id: str) -> None:
+    """Put a reply that can never be sent back where a person can act on it.
+
+    `reply_status` goes to "pending" when a reply is queued, and only the send
+    step clears it. A permanently failed send therefore left the row at
+    "pending" for good: the review queue lists only runs in `awaiting_approval`,
+    so the failed run vanished from it while the email kept showing "Awaiting
+    approval" with nothing left to approve or withdraw. A dead end, and found by
+    testing the real screen rather than by any unit test.
+
+    Back to "draft" rather than "none": the drafted text is still there and
+    still wanted; what failed was delivery, not the drafting. The reviewer sees
+    it in the drafts queue again and can retry once the configuration is fixed.
+    """
+    email = await session.get(Email, email_id)
+    if email is not None and email.reply_status == "pending":
+        email.reply_status = "draft"
+        await session.commit()
+
+
 @handlers.handler("mail.send_reply")
 async def send_reply(ctx) -> StepResult:
     """Actually send. Reached only after a human approval is on record.
@@ -319,8 +340,9 @@ async def send_reply(ctx) -> StepResult:
         try:
             send_creds = _send_creds(mailbox)
         except MissingCredential as exc:
-            # Permanent until someone fixes the mailbox configuration, so `fail`
-            # rather than `retry`: three attempts would find the same gap.
+            # Permanent until someone fixes the configuration, so `fail` rather
+            # than `retry`: three attempts would find the same gap.
+            await _release_from_pending(session, ctx.subject_ref)
             return StepResult.fail(str(exc))
 
     # Who actually released this send, read from the approval record rather than
@@ -376,16 +398,39 @@ def _send_creds(mailbox: Mailbox) -> dict:
     found this: the column is `str | None` and `crypto.decrypt` takes `str`.
     """
     if mailbox.provider == "graph":
-        if not mailbox.client_secret_enc:
+        # Graph app credentials are deployment configuration, not per-mailbox
+        # rows: one app registration carries the Mail.Send grant across every
+        # approved mailbox, and `sync.py` already authenticates exactly this way
+        # when it ingests. A row may still carry its own, so those win where
+        # present -- but reading *only* the row was wrong. With none set on any
+        # mailbox (the live state when this was found end to end), every send
+        # failed with "no client secret" while ingestion kept working, and the
+        # approval gate held a reply it could never release.
+        tenant_id = mailbox.tenant_id or settings.graph_tenant_id
+        client_id = mailbox.client_id or settings.graph_client_id
+        client_secret = (
+            crypto.decrypt(mailbox.client_secret_enc)
+            if mailbox.client_secret_enc
+            else settings.graph_client_secret
+        )
+        if not (tenant_id and client_id and client_secret):
             raise MissingCredential(
-                "mailbox %s is configured for graph but has no client secret"
-                % mailbox.id
+                "mailbox %s is configured for graph but no Graph credentials are "
+                "available, on the mailbox or in deployment configuration" % mailbox.id
+            )
+        # The physical mailbox the message goes out from. `username` is empty on
+        # rows created by the PW mailbox model, which carry graph_user_id and
+        # address instead -- Graph accepts either in /users/{id}/sendMail.
+        sender = mailbox.username or mailbox.graph_user_id or mailbox.address
+        if not sender:
+            raise MissingCredential(
+                "mailbox %s has no address to send from" % mailbox.id
             )
         return {
-            "tenant_id": mailbox.tenant_id,
-            "client_id": mailbox.client_id,
-            "client_secret": crypto.decrypt(mailbox.client_secret_enc),
-            "mailbox": mailbox.username,
+            "tenant_id": tenant_id,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "mailbox": sender,
         }
     if not mailbox.password_enc:
         raise MissingCredential(
@@ -490,9 +535,42 @@ async def submit_for_approval(
         subject_ref=email_id,
         principal=principal,
         payload={"body": body} if body else {},
-        idempotency_key=email_id,
+        idempotency_key=await _attempt_key(email_id),
     )
     return await orch.run_to_completion(run.id, principal=principal)
+
+
+#: Terminal states a reply can be queued again after. `SUCCEEDED` is deliberately
+#: absent -- that reply went out, and a second attempt would send it twice.
+_RETRYABLE: frozenset = frozenset(
+    st for st in TERMINAL if st is not WorkflowState.SUCCEEDED
+)
+
+
+async def _attempt_key(email_id: str) -> str:
+    """The idempotency key for queueing a reply to this email.
+
+    The key is the email id, so a double-clicked Send button produces one review
+    item rather than two. That much was right. What it also did was hold the key
+    forever: a run that ended without sending -- a misconfigured mailbox, a
+    rejection -- kept owning `email_id`, so every later attempt was answered with
+    `duplicate_suppressed` and the stale failed run. The reply became permanently
+    unsendable, and the screen showed the first failure's error again each time.
+
+    So the key carries a generation. It stays `email_id` while that run is still
+    open or has succeeded; once an attempt has ended without sending, the next
+    one takes the following generation and starts cleanly. Found end to end,
+    after a genuine send failure left a reply that could not be retried at all.
+    """
+    key = email_id
+    for generation in range(2, 50):
+        existing = await workflow_repository().find_by_idempotency_key(
+            definition=REPLY_APPROVAL, idempotency_key=key
+        )
+        if existing is None or existing.state not in _RETRYABLE:
+            return key
+        key = "%s#%d" % (email_id, generation)
+    return key
 
 
 async def reject_open_run(
