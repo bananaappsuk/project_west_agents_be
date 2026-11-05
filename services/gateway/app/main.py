@@ -32,6 +32,12 @@ ROUTES: list[tuple[str, str]] = sorted(
         ("/common", settings.auth_url),
         ("/emails", settings.mail_agent_url),
         ("/mailboxes", settings.mail_agent_url),  # the approved shared mailboxes this user may read
+        # The approval gate's own endpoints: the review queue, and approve/reject/
+        # cancel on a run. Without this entry the gate is reachable only by queueing
+        # a reply (POST /emails/{id}/reply) with no way to release it, so every
+        # outbound reply would stall at AWAITING_APPROVAL -- the mandatory gate
+        # would read as an outage rather than a control.
+        ("/workflows", settings.mail_agent_url),
         ("/folders", settings.mail_agent_url),
         ("/alerts", settings.mail_agent_url),
         ("/settings", settings.mail_agent_url),
