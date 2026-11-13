@@ -21,5 +21,17 @@ class Settings(BaseServiceSettings):
     entra_scope: str = "access_as_user"
     entra_max_token_age: int = 300       # seconds; reject access tokens issued earlier than this
 
+    # Entra security group whose members are entitled to the Voice Agent
+    # ("PW-Voice-Users"), as an object id. Voice entitlement is group-based and
+    # all-or-nothing by design: there are no internal Voice roles and no
+    # per-recording permissions, so this one setting is the whole Voice
+    # authorization model.
+    #
+    # Unset means NOBODY is entitled to Voice. That is deliberate: the failure
+    # mode of a missing group id must be "no access" rather than "all access",
+    # and before this setting existed every signed-in user received a Voice
+    # token automatically.
+    entra_voice_group_id: str | None = None
+
 
 settings = Settings()

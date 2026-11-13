@@ -2,9 +2,9 @@
 
 The frontend signs the user in with MSAL and POSTs the access token it got for
 `api://<client-id>/access_as_user` as a Bearer header. We verify it (app/entra.py),
-find the user by Entra object id (`oid`), sync their Entra app role into
-their memberships for every agent app, and return platform tokens for each app —
-so the gateway and every downstream service keep verifying our own JWTs unchanged.
+find the user by Entra object id (`oid`), work out which agent apps they are
+entitled to, and return platform tokens for **those apps only** — so the gateway
+and every downstream service keep verifying our own JWTs unchanged.
 
 Entra is the source of truth for access:
 - the enterprise app has "Assignment required", so only assigned staff get a token;
@@ -13,6 +13,23 @@ Entra is the source of truth for access:
 - a pre-Entra user row is bound to its Entra account on first sign-in (UPN = email,
   our tenant, row not already bound) — from then on it's found by `oid`;
 - an assigned user with no local row is provisioned on first sign-in.
+
+Entitlement is per application, and the two agents do not share a rule
+(`_entitled_apps`):
+
+- **Email Agent** — the app role is necessary and sufficient, unchanged. Which
+  shared mailboxes the person may then read, send from or approve in is decided by
+  the mail agent against its own access rules, not here.
+- **Voice Agent** — the app role *plus* membership of the `PW-Voice-Users` Entra
+  security group (`ENTRA_VOICE_GROUP_ID`). Voice has no internal roles and no
+  per-recording permissions, so that group is the whole of its access model: a
+  member gets the entire capability, a non-member gets no Voice token at all.
+
+A membership is created only for an entitled app, and an existing membership for an
+app the user is no longer entitled to is removed along with that app's refresh
+tokens (`_revoke_app_access`). Before this, the loop provisioned a membership for
+every agent app on every sign-in, so everyone who could sign in received a Voice
+token automatically — which is what this endpoint is being changed to stop.
 """
 
 from __future__ import annotations
@@ -40,8 +57,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Highest wins if a user somehow holds more than one.
 ENTRA_ROLES = [("Agents.Superadmin", "Superadmin"), ("Agents.Admin", "Admin"), ("Agents.User", "User")]
 
-# Every staff member gets the same role in both agents (as the old invite flow did).
-AGENT_APPS = ["mail-agent", "voice-agent"]
+MAIL_APP = "mail-agent"
+VOICE_APP = "voice-agent"
+
+#: The agent apps a sign-in is *considered* for. Which of them it is actually
+#: entitled to is `_entitled_apps`; this list only fixes the order so the audit
+#: line and the response are stable.
+AGENT_APPS = [MAIL_APP, VOICE_APP]
 
 # Returned as the 403 `detail` so the frontend can show its "no access" page.
 NO_ACCESS = "no_access"
@@ -52,6 +74,68 @@ def _display_role(entra_roles: list[str]) -> str | None:
         if value in entra_roles:
             return display
     return None
+
+
+def _entitled_apps(*, role: str | None, groups: list[str], oid: str | None = None) -> tuple[str, ...]:
+    """Which agent apps this sign-in may be issued tokens for.
+
+    Pure: no I/O, no database, no session. The one decision that governs whether a
+    person can reach a capability at all is therefore also the cheapest thing in
+    this service to test exhaustively -- the same reason the mail agent keeps
+    `receiving_address.resolve` free of I/O.
+
+    **Email is unchanged.** An Entra app role is necessary and sufficient, exactly
+    as it was before this function existed. Mailbox-level authorization continues to
+    happen in the mail agent against its own `mailbox_access_rule` rows; nothing here
+    touches it.
+
+    **Voice is group-based and all-or-nothing.** Membership of `PW-Voice-Users`
+    (`ENTRA_VOICE_GROUP_ID`) is required on top of the app role. There are no
+    internal Voice roles and no per-recording permissions, so a member receives the
+    whole capability and a non-member receives no token for it -- which makes this
+    single decision the entire Voice authorization model, and the reason it is
+    stated in one place rather than spread across the Voice service's routes.
+
+    Note that the role is still required for Voice as well as the group. Two
+    reasons, neither cosmetic: the PW Agents enterprise app has "Assignment
+    required", so a user with no app role cannot obtain an Entra token for this API
+    in the first place; and the role is what supplies the membership's permission
+    set (`routers/orgs.py::_perm_keys`), so there is no coherent membership to
+    create without one. Group membership alone is therefore not a grant.
+
+    Fails closed on both ways this can be misconfigured, because the previous
+    behaviour of this endpoint was to hand every signed-in user a Voice token:
+
+      * no `entra_voice_group_id` configured -> nobody is entitled to Voice;
+      * no `groups` claim on the token at all -> nobody is entitled to Voice.
+
+    The second case is the Entra group-overage path (`_entra_groups` returns an
+    empty list and logs it). Denying Voice there is correct, and it is logged
+    distinctly below because "not in the group" and "we could not see any group"
+    are indistinguishable downstream while having completely different fixes.
+    """
+    if role is None:
+        return ()
+
+    apps = [MAIL_APP]
+
+    voice_group = (settings.entra_voice_group_id or "").strip()
+    if not voice_group:
+        log.warning(
+            "AUDIT entra voice DENIED oid=%s reason=no_group_configured "
+            "(set ENTRA_VOICE_GROUP_ID to the PW-Voice-Users object id)", oid,
+        )
+    elif not groups:
+        log.warning(
+            "AUDIT entra voice DENIED oid=%s reason=no_groups_claim "
+            "(group overage, or the app registration is not emitting the claim)", oid,
+        )
+    elif voice_group.lower() in {str(g).strip().lower() for g in groups if g}:
+        apps.append(VOICE_APP)
+    else:
+        log.info("AUDIT entra voice DENIED oid=%s reason=not_in_group", oid)
+
+    return tuple(apps)
 
 
 def _bearer(authorization: str | None) -> str:
@@ -69,6 +153,49 @@ async def _revoke_access(session: AsyncSession, user: User) -> None:
         update(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked.is_(False)).values(revoked=True)
     )
     await session.commit()
+
+
+async def _revoke_app_access(session: AsyncSession, *, user: User, app: Application) -> bool:
+    """Entitlement withdrawn for ONE app: drop that membership and end that app's
+    sessions. Returns whether anything was actually revoked.
+
+    Narrower than `_revoke_access`, which drops every membership when the Entra app
+    role itself is gone. Here the user keeps the other agent entirely.
+
+    This is not belt-and-braces on top of refusing the token -- it is load-bearing.
+    `POST /auth/refresh` re-reads the membership row and mints a fresh access token
+    whenever one exists (routers/auth.py), so a stale membership plus a refresh
+    token still in play would keep renewing Voice access for up to the remainder of
+    the 8-hour session. Removing the membership makes the refresh path answer
+    "membership revoked" at the next rotation instead, which is at most
+    `access_token_ttl` (15 minutes) away.
+
+    Deliberately does NOT commit: the caller commits once for the whole sign-in, so
+    a failure part-way through cannot leave a user with a revoked membership and no
+    tokens.
+    """
+    revoked = False
+    for membership in await session.scalars(
+        select(Membership).where(Membership.user_id == user.id, Membership.app_id == app.id)
+    ):
+        await session.delete(membership)
+        revoked = True
+
+    result = await session.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == user.id,
+            RefreshToken.app_id == app.id,
+            RefreshToken.revoked.is_(False),
+        )
+        .values(revoked=True)
+    )
+    if result.rowcount:
+        revoked = True
+
+    if revoked:
+        log.info("AUDIT entra entitlement revoked user=%s app=%s", user.id, app.key)
+    return revoked
 
 
 async def _bind_existing(session: AsyncSession, claims: dict, oid: str, upn: str) -> User | None:
@@ -157,6 +284,36 @@ async def _app_for(session: AsyncSession, key: str) -> Application:
 def _entra_groups(claims: dict) -> list[str]:
     """Entra security-group object ids from the signed-in user's token.
 
+    ── Entra token configuration this depends on ────────────────────────────────
+    The token read here is the **access token** for `api://<ENTRA_CLIENT_ID>/
+    access_as_user` (see app/entra.py: audience is the client id, issuer is v2).
+    Entra does not emit `groups` by default, and it is configured per *token type*,
+    so the requirement is specific:
+
+      On the `ENTRA_CLIENT_ID` app registration -> Token configuration ->
+      "Add groups claim", with the **Access** token box ticked.
+      (Manifest equivalent: `groupMembershipClaims`, plus an `optionalClaims.
+      accessToken` entry named `groups`.)
+
+    Ticking only **ID** is the failure that looks like a code bug: sign-in succeeds,
+    `oid`/`tid`/`scp` all verify, and `groups` is simply absent -- so Voice is denied
+    to everyone and mailbox access resolves to nothing. `_verify` deliberately does
+    not require the claim (it is not an authentication input), which is why the
+    symptom surfaces here rather than as a 401.
+
+    `groupMembershipClaims` choice is Project West's, and the two sensible values
+    differ in a way worth knowing: `SecurityGroup` emits every security group the
+    user belongs to, while `ApplicationGroup` emits only groups assigned to this
+    enterprise application. `ApplicationGroup` is the safer fit here -- it keeps the
+    claim small (so overage below is unreachable in practice) and makes "this group
+    participates in authorization" an explicit act rather than a side effect of
+    directory membership.
+
+    Object ids are what arrive, which is what both consumers compare against:
+    `ENTRA_VOICE_GROUP_ID` here, and `mailbox_access_rule.entra_group_id` in the
+    mail agent. Nothing matches on group *name*, so renaming a group is safe.
+    ─────────────────────────────────────────────────────────────────────────────
+
     These are passed through to the agent access tokens so the mail agent can
     resolve which shared mailboxes the person may read and send from. Only raw
     group ids travel; the resolved mailbox set is never put in a token.
@@ -211,9 +368,27 @@ async def entra_sign_in(authorization: str | None = Header(default=None), sessio
     # Written every sign-in, so a group removal in Entra lands here too.
     user.entra_groups = groups
 
+    # Which capabilities this person may reach at all. Decided once, from verified
+    # token claims only, before any membership is created -- so a membership is a
+    # consequence of entitlement rather than the thing that establishes it. That
+    # ordering is the fix: this loop used to provision a membership for every app
+    # unconditionally, which handed a Voice token to everyone who could sign in.
+    entitled = _entitled_apps(role=role, groups=groups, oid=claims.get("oid"))
+    log.info(
+        "AUDIT entra entitlement oid=%s role=%s groups_in_token=%d apps=%s",
+        claims.get("oid"), role, len(groups), ",".join(entitled) or "-",
+    )
+
     tokens: dict[str, TokenOut] = {}
     for app_key in AGENT_APPS:
         app = await _app_for(session, app_key)
+
+        if app_key not in entitled:
+            # No token, and no membership left behind for the refresh path to renew
+            # from. Nothing is created for an app the user may not have.
+            await _revoke_app_access(session, user=user, app=app)
+            continue
+
         app_role = await _ensure_role(session, app, org.id, role)
         membership = await session.scalar(
             select(Membership)
@@ -230,6 +405,14 @@ async def entra_sign_in(authorization: str | None = Header(default=None), sessio
             session, user=user, org_id=org.id, app=app, roles=roles, scope=scope,
             groups=groups, commit=False
         )
+
+    # Entitled to nothing at all. Reachable only if the entitlement rules change to
+    # make the app role insufficient for Email too; today a user with no role has
+    # already been refused above. Answered the same way regardless, so the frontend
+    # has one no-access path rather than two.
+    if not tokens:
+        log.warning("AUDIT entra sign-in refused: no entitled app oid=%s", claims.get("oid"))
+        raise HTTPException(status.HTTP_403_FORBIDDEN, NO_ACCESS)
 
     await session.commit()
     return EntraTokensOut(tokens=tokens)

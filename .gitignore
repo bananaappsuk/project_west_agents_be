@@ -12,6 +12,12 @@ __pycache__/
 .env
 .env.local
 *.env
+# Timestamped copies taken before changing a DATABASE_URL. These hold the full
+# connection string, password included, and none of the patterns above catch a
+# name like `.env.backup-20261113-090845`. Same shape of gap as the signing key
+# in DECISIONS.md D12: untracked and unignored, one `git add -A` from committed.
+.env.backup*
+*.env.backup*
 
 # Keys (dev-generated signing keys)
 keys/

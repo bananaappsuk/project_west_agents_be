@@ -7,6 +7,7 @@ from sqlalchemy import (
     ARRAY,
     Boolean,
     DateTime,
+    Index,
     Integer,
     String,
     Text,
@@ -86,7 +87,19 @@ class Recording(Base):
     # new = latest cron extraction; old = swept by a later run
     status: Mapped[str] = mapped_column(String, default="new", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (UniqueConstraint("ext_id", name="uq_recording_ext"),)
+    __table_args__ = (
+        UniqueConstraint("ext_id", name="uq_recording_ext"),
+        # Declared here as well as in migrate_add_taxonomy_columns.sql. The
+        # migration alters a database that already exists; this is what a database
+        # created from scratch by `create_all` gets. Without it the two diverge --
+        # which is exactly what happened when the voice service was pointed at a
+        # fresh database and came up with no index on either taxonomy column.
+        #
+        # Both are queried on every alerts request (route) and whenever an item is
+        # filtered by a cross-cutting flag.
+        Index("ix_recordings_route", "route"),
+        Index("ix_recordings_flags", "flags", postgresql_using="gin"),
+    )
 
 
 class VoiceSettings(Base):

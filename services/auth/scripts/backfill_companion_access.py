@@ -1,5 +1,5 @@
-"""One-off backfill: grant the companion app to every existing (user, org) that
-only ever had one of {mail-agent, voice-agent}.
+"""One-off backfill: grant the companion app to an existing (user, org) that only
+ever had one of {mail-agent, voice-agent}.
 
 scripts/seed_org.py grants the seeded admin both apps up front — this catches
 everyone else: accounts created before that existed, or accounts invited into
@@ -12,6 +12,19 @@ find-or-create role logic the "Users & Roles" invite flow uses
 
 Safe to re-run: every insert is preceded by an existence check, so an already
 backfilled (or already-dual-app) pair is left untouched.
+
+⚠️ voice-agent is NO LONGER BACKFILLED — see `NEVER_BACKFILL` below
+----------------------------------------------------------------------
+This script predates per-application entitlement. Written as it was, one
+`--apply` run would grant `voice-agent` to every Email user and silently undo
+the access control in `app/routers/entra.py`, because Voice entitlement is now
+membership of the PW-Voice-Users Entra group and nothing else.
+
+The script is kept rather than deleted: the `voice-agent -> mail-agent`
+direction is still consistent with the model (Email entitlement is the Agents
+app role, which any existing member already holds), and the dry-run inventory it
+prints is useful on its own. Only the direction that would grant Voice is
+refused.
 
 Usage (from backend/services/auth with the venv active):
     python -m scripts.backfill_companion_access            # dry run — prints only
@@ -31,6 +44,31 @@ from app.models import Application, Membership, Organization, User
 from app.routers.orgs import INTERNAL_TO_DISPLAY, _ensure_role
 
 COMPANION = {"mail-agent": "voice-agent", "voice-agent": "mail-agent"}
+
+#: Apps this script must never create a membership for, however the plan was built.
+#:
+#: Voice entitlement is membership of the PW-Voice-Users Entra security group,
+#: resolved at sign-in by `app/routers/entra.py::_entitled_apps`. A membership
+#: created here would not merely duplicate that decision -- it would *override* it,
+#: because `POST /auth/refresh` mints a token from whatever membership row exists.
+#: So a single `--apply` would hand Voice back to everyone it was just taken from,
+#: and nothing in the sign-in path would notice.
+#:
+#: Granting Voice is therefore a group change in Entra, never a database write.
+NEVER_BACKFILL = frozenset({"voice-agent"})
+
+
+def _permitted(planned: list[tuple[str, str, str, str]]) -> tuple[list, list]:
+    """Split a plan into (allowed, refused) on `NEVER_BACKFILL`.
+
+    Pure, so the guard is testable without a database -- which matters, because the
+    thing being asserted is a negative ("this never happens") and the natural place
+    to discover it otherwise is in production data.
+    """
+    allowed, refused = [], []
+    for item in planned:
+        (refused if item[3] in NEVER_BACKFILL else allowed).append(item)
+    return allowed, refused
 
 
 async def _apps(session: AsyncSession) -> dict[str, Application]:
@@ -65,8 +103,20 @@ async def run(apply: bool) -> None:
                 if need not in keys_present:
                     planned.append((user_id, org_id, have, need))
 
+        planned, refused = _permitted(planned)
+
+        if refused:
+            print(
+                f"REFUSED {len(refused)} grant(s) into {'/'.join(sorted(NEVER_BACKFILL))} — "
+                "entitlement for that app comes from an Entra group at sign-in, not from "
+                "this script. Add the user to PW-Voice-Users instead."
+            )
+            for user_id, org_id, have, need in refused:
+                user = await session.get(User, user_id)
+                print(f"  refused: {user.email if user else user_id}: has {have} -> {need}")
+
         if not planned:
-            print("Nothing to backfill — every (user, org) already has both apps.")
+            print("Nothing to backfill.")
             return
 
         print(f"{len(planned)} membership(s) to backfill:")
@@ -81,6 +131,16 @@ async def run(apply: bool) -> None:
 
         created = 0
         for user_id, org_id, have, need in planned:
+            # Second, unconditional check at the write site. `_permitted` above has
+            # already filtered the plan; this refuses again immediately before the
+            # INSERT so that a future edit to the planning code cannot reach the
+            # write without passing a guard. Cheap, and the failure it prevents is
+            # one nothing downstream would report.
+            if need in NEVER_BACKFILL:
+                raise SystemExit(
+                    f"refusing to create a {need} membership: entitlement for that app "
+                    "is an Entra group membership resolved at sign-in, not a database row"
+                )
             # Re-check right before writing — another process (or an earlier
             # iteration granting the reverse direction) may have already covered it.
             existing = await session.scalar(
