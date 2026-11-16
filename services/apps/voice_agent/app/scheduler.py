@@ -1,9 +1,9 @@
-"""Background scheduler, driven by VoiceSettings (BT Cloud cron config).
+"""Background scheduler, driven by the configured recording source.
 
-A tick fires every CRON_TICK_MINUTES. On each tick, if VoiceSettings is enabled (and
-has BT Cloud creds), it runs the fetch pipeline **if** enough time has elapsed since
-the last run to satisfy the chosen frequency. CRON_ENABLED is the master on/off
-switch.
+A tick fires every CRON_TICK_MINUTES. On each tick, if a recording source is fully
+configured (see source_config.py), it runs the fetch pipeline **if** enough time has
+elapsed since the last run to satisfy VOICE_CRON_FREQUENCY. CRON_ENABLED is the
+master on/off switch.
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import func, select
 
-from . import pipeline
+from . import pipeline, source_config
 from .config import settings
 from .db import SessionLocal
-from .models import AgentRun, VoiceSettings
+from .models import AgentRun
 
 log = logging.getLogger("voice_agent.scheduler")
 scheduler = AsyncIOScheduler()
@@ -34,17 +34,16 @@ def _interval_minutes(freq: str) -> int:
 
 
 async def _tick() -> None:
-    async with SessionLocal() as session:
-        cfg = await session.scalar(select(VoiceSettings))
-
-    if cfg is None or not cfg.enabled:
-        log.info("tick: no enabled recording source — nothing to do")
+    # One check now, against deployment configuration, instead of three against a
+    # database row. `configured` means credentials are actually present, so a
+    # half-configured source cannot reach the fetch and fall through to BT Cloud's
+    # demo recordings.
+    cfg = source_config.load()
+    if not cfg.configured:
+        log.info("tick: %s — nothing to do", cfg.reason)
         return
     if pipeline.is_running():
         log.info("previous run still in progress — skipping this tick")
-        return
-    if not cfg.endpoint:
-        log.info("enabled but no endpoint configured — skipping")
         return
 
     now = datetime.now(timezone.utc)

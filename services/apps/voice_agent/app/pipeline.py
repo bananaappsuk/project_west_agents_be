@@ -15,9 +15,9 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, bt_client, crm_sync, crypto, s3_client
+from . import agent_client, bt_client, crm_sync, s3_client, source_config
 from .db import SessionLocal
-from .models import AgentRun, Notification, Recording, VoiceSettings
+from .models import AgentRun, Notification, Recording
 
 log = logging.getLogger("voice_agent.pipeline")
 
@@ -106,33 +106,22 @@ async def fetch_and_process(count: int, *, sweep: bool = False) -> list[str]:
 
 
 async def _run(count: int, sweep: bool, run_id: str) -> list[str]:
-    # 1) short txn: read the org's connection settings for whichever source is active
-    async with SessionLocal() as s:
-        cfg = await s.scalar(select(VoiceSettings))
-        if not cfg or not cfg.enabled:
-            log.warning("fetch aborted: no enabled recording source connection")
-            raise LookupError("no recording source configured for this org")
-        source_type = cfg.source_type
-        if source_type == "s3":
-            list_fn, transcribe_fn = s3_client.list_latest, s3_client.transcribe_one
-            creds = {
-                "endpoint": cfg.s3_endpoint,
-                "region": cfg.s3_region,
-                "bucket": cfg.s3_bucket,
-                "prefix": cfg.s3_prefix,
-                "access_key_id": cfg.s3_access_key_id,
-                "secret_access_key": crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
-            }
-            transcribe_creds = {k: v for k, v in creds.items() if k != "prefix"}
-        else:
-            list_fn, transcribe_fn = bt_client.list_latest, bt_client.transcribe_one
-            creds = {
-                "endpoint": cfg.endpoint,
-                "client_id": cfg.client_id,
-                "client_secret": crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
-                "jwt": crypto.decrypt(cfg.jwt_enc) if cfg.jwt_enc else "",
-            }
-            transcribe_creds = creds
+    # 1) the recording source, from deployment configuration. No database read and
+    #    no decryption: see source_config.py for why this moved out of the
+    #    voice_settings row. Refusing an unconfigured source here is what stops a
+    #    half-configured deployment quietly storing BT Cloud's demo recordings.
+    cfg = source_config.load()
+    if not cfg.configured:
+        log.warning("fetch aborted: %s", cfg.reason)
+        raise LookupError(cfg.reason)
+
+    source_type = cfg.source_type
+    if source_type == source_config.S3:
+        list_fn, transcribe_fn = s3_client.list_latest, s3_client.transcribe_one
+    else:
+        list_fn, transcribe_fn = bt_client.list_latest, bt_client.transcribe_one
+    creds = cfg.creds
+    transcribe_creds = cfg.transcribe_creds
 
     # 2) list metadata from the source — NO DB connection held, NO audio download yet.
     # Downloading + transcribing happens below, in step 3.5, and only for recordings this

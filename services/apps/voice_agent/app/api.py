@@ -9,15 +9,14 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import agent_client, bt_client, crm_sync, crypto, pipeline, s3_client, transcribe
+from . import agent_client, bt_client, crm_sync, pipeline, s3_client, source_config, transcribe
 from .config import settings
 from .db import get_session
 from .deps import require
-from .models import AgentRun, Notification, Recording, VoiceSettings
+from .models import AgentRun, Notification, Recording
 from .schemas import (
     RelabelIn,
     ReplyDraftIn,
-    SettingsIn,
     serialize_notification,
     serialize_recording,
 )
@@ -39,21 +38,6 @@ async def _get_recording(session: AsyncSession, rec_id: str) -> Recording:
     if not r:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "recording not found")
     return r
-
-
-async def _get_config(session: AsyncSession) -> VoiceSettings:
-    """Find-or-create the VoiceSettings row. Mirrors mail_agent's `_get_config`:
-    the master on/off switch (`enabled`) defaults on the moment the agent is first
-    looked at, independent of whether a real recording-source connection has been
-    configured yet — same as Email Agent showing "Running" before a mailbox is set
-    up. The scheduler already no-ops gracefully on an enabled-but-unconfigured agent
-    (see scheduler.py's "enabled but no endpoint configured — skipping")."""
-    cfg = await session.scalar(select(VoiceSettings))
-    if not cfg:
-        cfg = VoiceSettings(enabled=settings.cron_enabled)
-        session.add(cfg)
-        await session.commit()
-    return cfg
 
 
 # ---------- recordings ----------
@@ -173,9 +157,14 @@ async def fetch_recordings(
     time), far longer than any request should stay open. Poll GET /voice/agent/status
     (its `running` flag) to know when it's done — that's real server state, so it
     stays correct no matter which page you're on."""
-    cfg = await session.scalar(select(VoiceSettings))
-    if not cfg or not cfg.enabled:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no recording source configured")
+    # Checks that credentials are actually PRESENT, not merely that a row exists.
+    # The old guard passed whenever a voice_settings row was enabled, and the
+    # settings reader created one the moment anyone loaded the dashboard - so on a
+    # fresh database this route fell through to BT Cloud's demo fallback and filled
+    # it with fabricated recordings indistinguishable from real ones once stored.
+    src = source_config.load()
+    if not src.configured:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, src.reason)
 
     if pipeline.is_running():
         raise HTTPException(status.HTTP_409_CONFLICT, "a sync is already in progress")
@@ -203,21 +192,20 @@ async def upload_recording(
 
     source_type, ext_id = "upload", str(uuid.uuid4())
     if save_audio:
-        cfg = await session.scalar(select(VoiceSettings))
-        if not cfg or not cfg.s3_bucket:
+        src = source_config.load()
+        if src.source_type != source_config.S3 or not src.configured:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "no S3-compatible storage configured — set one up in Settings to save audio",
+                "saving audio needs S3-compatible storage configured in the "
+                "environment (VOICE_SOURCE_TYPE=s3 with S3_BUCKET and keys)",
             )
         ext = "wav" if "wav" in content_type else "mp3"
         key = f"uploads/{ext_id}.{ext}"
         try:
             await run_in_threadpool(
                 s3_client.upload_object,
-                endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
-                access_key_id=cfg.s3_access_key_id,
-                secret_access_key=crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
                 key=key, body=audio, content_type=content_type,
+                **src.transcribe_creds,
             )
         except Exception as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not save audio: {exc}") from exc
@@ -271,7 +259,7 @@ async def relabel_recording(
     return serialize_recording(r)
 
 
-async def _fetch_recording_audio(cfg: VoiceSettings | None, r: Recording) -> tuple[bytes, str]:
+async def _fetch_recording_audio(r: Recording) -> tuple[bytes, str]:
     """Re-fetches a recording's audio from its source on demand — nothing is stored
     locally (see pipeline.py: audio is discarded right after transcription). S3-sourced
     recordings are re-fetched from the bucket; BT Cloud recordings are re-fetched from
@@ -279,42 +267,41 @@ async def _fetch_recording_audio(cfg: VoiceSettings | None, r: Recording) -> tup
     possible for recordings synced after content_uri started being captured, with a JWT
     still configured. Shared by GET .../audio (playback) and
     POST .../retry-analysis (re-transcribing a recording whose transcript never came
-    through)."""
-    if r.source_type == "s3":
-        if not cfg or not cfg.s3_bucket:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no S3-compatible source configured")
+    through).
+
+    Note it keys off the RECORDING's `source_type`, not the currently configured one:
+    a row captured from a source the deployment has since moved away from has no
+    retrievable audio, and must 404 rather than be fetched with the wrong credentials.
+    """
+    src = source_config.load()
+    if r.source_type != src.source_type or not src.configured:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
+
+    if r.source_type == source_config.S3:
         try:
-            return await run_in_threadpool(
-                s3_client.download,
-                endpoint=cfg.s3_endpoint, region=cfg.s3_region, bucket=cfg.s3_bucket,
-                access_key_id=cfg.s3_access_key_id,
-                secret_access_key=crypto.decrypt(cfg.s3_secret_access_key_enc) if cfg.s3_secret_access_key_enc else "",
-                key=r.ext_id,
-            )
+            return await run_in_threadpool(s3_client.download, key=r.ext_id, **src.transcribe_creds)
         except Exception as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
-    elif r.source_type == "bt_cloud":
-        jwt = crypto.decrypt(cfg.jwt_enc) if (cfg and cfg.jwt_enc) else ""
-        if not r.content_uri or not jwt:
+
+    if r.source_type == source_config.BT_CLOUD:
+        if not r.content_uri:
+            # Captured before content_uri was recorded: there is no address to
+            # re-fetch from, and no credential makes that retrievable.
             raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
         try:
             return await run_in_threadpool(
-                bt_client.fetch_audio,
-                endpoint=cfg.endpoint, client_id=cfg.client_id,
-                client_secret=crypto.decrypt(cfg.client_secret_enc) if cfg.client_secret_enc else "",
-                jwt=jwt, content_uri=r.content_uri,
+                bt_client.fetch_audio, content_uri=r.content_uri, **src.creds
             )
         except Exception as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"could not fetch audio: {exc}") from exc
-    else:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
+
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "audio not available for this recording")
 
 
 @router.get("/recordings/{rec_id}/audio")
 async def get_recording_audio(rec_id: str, claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     r = await _get_recording(session, rec_id)
-    cfg = await session.scalar(select(VoiceSettings))
-    audio, content_type = await _fetch_recording_audio(cfg, r)
+    audio, content_type = await _fetch_recording_audio(r)
     return Response(content=audio, media_type=content_type)
 
 
@@ -336,11 +323,9 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
         raise HTTPException(status.HTTP_409_CONFLICT, "this recording is already being analyzed")
     try:
         r = await _get_recording(session, rec_id)
-        cfg = await session.scalar(select(VoiceSettings))
-
         transcript = r.transcript
         if not transcript or transcript == "(no transcript available)":
-            audio, content_type = await _fetch_recording_audio(cfg, r)
+            audio, content_type = await _fetch_recording_audio(r)
             transcript = await run_in_threadpool(transcribe.transcribe, audio, content_type)
             if not transcript:
                 raise HTTPException(status.HTTP_502_BAD_GATEWAY, "transcription returned no text for this recording")
@@ -430,7 +415,7 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
             Recording.category, Recording.sentiment, Recording.agent,
         )
     ))
-    cfg = await _get_config(session)
+    src = source_config.load()
 
     # The controlled PW taxonomy (agent_factory/app/taxonomy.py). Listed here rather
     # than imported because the agent factory is a separate service — the frontend
@@ -451,7 +436,9 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
         "new": sum(1 for r in rows if r.status == "new"),
         "pending": sum(1 for r in rows if r.reply_status == "pending"),
         "highRisk": sum(1 for r in rows if r.risk == "High"),
-        "syncStatus": "Healthy" if cfg.enabled else "Down",
+        # Healthy means the agent can actually reach a source, not merely that a
+        # settings row exists. An unconfigured deployment reports Down.
+        "syncStatus": "Healthy" if (settings.cron_enabled and src.configured) else "Down",
         "categoryBreakdown": [{"name": c, "count": sum(1 for r in rows if r.category == c)} for c in categories],
         "sentimentBreakdown": [{"name": s, "count": sum(1 for r in rows if r.sentiment == s)} for s in sentiments],
         "agentPerformance": [
@@ -466,88 +453,30 @@ async def stats(claims: dict = Depends(require(READ)), session: AsyncSession = D
     }
 
 
-# ---------- settings (recording source connection + cron) ----------
+# ---------- recording source (read-only; configured in the environment) ----------
 @router.get("/settings")
-async def get_settings(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    """Non-secret settings for prefilling the form. Secrets are never returned. Both source
-    field sets are always returned — one may be configured but currently pointed
-    at the other, and the form shouldn't lose it when the admin isn't looking at that tab."""
-    cfg = await session.scalar(select(VoiceSettings))
-    if not cfg:
-        return None
-    return {
-        "sourceType": cfg.source_type,
-        "endpoint": cfg.endpoint,
-        "clientId": cfg.client_id,
-        "clientSecret": "",  # redacted
-        "jwt": "",           # redacted
-        "secretConfigured": bool(cfg.client_secret_enc),
-        "jwtConfigured": bool(cfg.jwt_enc),
-        "s3Endpoint": cfg.s3_endpoint,
-        "s3Region": cfg.s3_region,
-        "s3Bucket": cfg.s3_bucket,
-        "s3Prefix": cfg.s3_prefix,
-        "s3AccessKeyId": cfg.s3_access_key_id,
-        "s3SecretAccessKey": "",  # redacted
-        "s3SecretConfigured": bool(cfg.s3_secret_access_key_enc),
-        "cronFrequency": cfg.cron_frequency,
-        "cronTime": cfg.cron_time,
-        "enabled": cfg.enabled,
-        "configured": True,
-    }
+async def get_settings(claims: dict = Depends(require(READ))):
+    """What recording source this deployment is pointed at, and whether it is usable.
+
+    Read-only. The source is configured from environment variables and does not
+    change at runtime (see source_config.py), so there is nothing here to write.
+    Kept as a route because "is the JWT actually set on this environment?" is the
+    first question asked when a sync produces nothing, and answering it from the
+    service itself beats reading someone's deployment dashboard over their shoulder.
+
+    Secrets are reported as booleans and never returned, not even partially.
+    """
+    return source_config.public_view()
 
 
-@router.post("/settings")
-async def save_settings(body: SettingsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    cfg = await session.scalar(select(VoiceSettings))
-    # Blank secret / jwt / s3 secret on save means "keep the stored one".
-    enc = crypto.encrypt(body.clientSecret) if body.clientSecret else (cfg.client_secret_enc if cfg else "")
-    jwt_enc = crypto.encrypt(body.jwt) if body.jwt else (cfg.jwt_enc if cfg else "")
-    s3_secret_enc = crypto.encrypt(body.s3SecretAccessKey) if body.s3SecretAccessKey else (cfg.s3_secret_access_key_enc if cfg else "")
-    if cfg:
-        cfg.source_type = body.sourceType
-        cfg.endpoint, cfg.client_id, cfg.client_secret_enc, cfg.jwt_enc = body.endpoint, body.clientId, enc, jwt_enc
-        cfg.s3_endpoint, cfg.s3_region, cfg.s3_bucket = body.s3Endpoint, body.s3Region, body.s3Bucket
-        cfg.s3_prefix, cfg.s3_access_key_id, cfg.s3_secret_access_key_enc = body.s3Prefix, body.s3AccessKeyId, s3_secret_enc
-        cfg.cron_frequency, cfg.cron_time, cfg.enabled = body.cronFrequency, body.cronTime, body.enabled
-    else:
-        session.add(VoiceSettings(
-            source_type=body.sourceType,
-            endpoint=body.endpoint, client_id=body.clientId, client_secret_enc=enc, jwt_enc=jwt_enc,
-            s3_endpoint=body.s3Endpoint, s3_region=body.s3Region, s3_bucket=body.s3Bucket,
-            s3_prefix=body.s3Prefix, s3_access_key_id=body.s3AccessKeyId, s3_secret_access_key_enc=s3_secret_enc,
-            cron_frequency=body.cronFrequency, cron_time=body.cronTime, enabled=body.enabled,
-        ))
-    await session.commit()
-    return {"ok": True}
+# `POST /settings` and `POST /settings/test` are deliberately gone. They wrote
+# credentials into the voice_settings row, which is no longer where the source is
+# read from -- so keeping them would have let someone save a configuration that the
+# running service then ignored. Connection problems now surface against the real
+# deployed configuration: GET /settings reports whether it is complete, and
+# POST /recordings/fetch refuses with the same reason when it is not.
 
 
-@router.post("/settings/test")
-async def test_settings(body: SettingsIn, claims: dict = Depends(require(WRITE)), session: AsyncSession = Depends(get_session)):
-    cfg = await session.scalar(select(VoiceSettings))
-    try:
-        if body.sourceType == "s3":
-            secret = body.s3SecretAccessKey or (crypto.decrypt(cfg.s3_secret_access_key_enc) if (cfg and cfg.s3_secret_access_key_enc) else "")
-            mode = await run_in_threadpool(
-                s3_client.test_connection,
-                endpoint=body.s3Endpoint, region=body.s3Region, bucket=body.s3Bucket,
-                prefix=body.s3Prefix, access_key_id=body.s3AccessKeyId, secret_access_key=secret,
-            )
-        else:
-            secret = body.clientSecret or (crypto.decrypt(cfg.client_secret_enc) if (cfg and cfg.client_secret_enc) else "")
-            jwt = body.jwt or (crypto.decrypt(cfg.jwt_enc) if (cfg and cfg.jwt_enc) else "")
-            # With a JWT this performs a real RingCentral/BT Cloud Work auth; without one it
-            # just validates the fields (demo mode).
-            mode = await run_in_threadpool(
-                bt_client.test_connection,
-                endpoint=body.endpoint, client_id=body.clientId, client_secret=secret, jwt=jwt,
-            )
-    except Exception as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"connection failed: {exc}") from exc
-    return {"ok": True, "mode": mode}
-
-
-# ---------- notifications ----------
 @router.get("/notifications")
 async def list_notifications(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
     rows = await session.scalars(
@@ -568,7 +497,8 @@ async def mark_all_read(claims: dict = Depends(require(READ)), session: AsyncSes
 # ---------- agent / cron status ----------
 @router.get("/agent/status")
 async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSession = Depends(get_session)):
-    cfg = await _get_config(session)
+    src = source_config.load()
+    enabled = settings.cron_enabled and src.configured
     runs = list(await session.scalars(select(AgentRun).order_by(AgentRun.run_at.desc())))
     last = runs[0] if runs else None
 
@@ -580,16 +510,16 @@ async def agent_status(claims: dict = Depends(require(READ)), session: AsyncSess
         d["highRisk"] += r.high_risk
 
     next_run = ""
-    if cfg.enabled and last:
-        interval = _FREQ_MINUTES.get(cfg.cron_frequency, 360)
+    if enabled and last:
+        interval = _FREQ_MINUTES.get(src.cron_frequency, 360)
         next_run = (last.run_at + timedelta(minutes=interval)).isoformat()
 
     return {
         "running": pipeline.is_running(),
         "config": {
-            "cronFrequency": cfg.cron_frequency,
-            "cronTime": cfg.cron_time,
-            "enabled": cfg.enabled,
+            "cronFrequency": src.cron_frequency,
+            "cronTime": src.cron_time,
+            "enabled": enabled,
         },
         "stats": {
             "totalRuns": len(runs),
