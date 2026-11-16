@@ -102,33 +102,6 @@ class Recording(Base):
     )
 
 
-class VoiceSettings(Base):
-    """Voice agent settings. One row, enforced by `ux_voice_settings_singleton` —
-    the old org_id column's UNIQUE constraint used to provide that implicitly."""
-    __tablename__ = "voice_settings"
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)
-    # Which connector fetch_and_process() dispatches to — "bt_cloud" | "s3". Both field sets
-    # below persist regardless of which is active, so switching doesn't discard the other.
-    source_type: Mapped[str] = mapped_column(String, default="bt_cloud")
-    # BT Cloud (RingCentral)
-    endpoint: Mapped[str] = mapped_column(String, default="")  # RingCentral/BT Cloud Work server URL
-    client_id: Mapped[str] = mapped_column(String, default="")
-    client_secret_enc: Mapped[str] = mapped_column(Text, default="")
-    jwt_enc: Mapped[str] = mapped_column(Text, default="")  # RingCentral JWT credential (server-to-server auth)
-    # S3-compatible bucket (AWS S3, Backblaze B2, MinIO, …)
-    s3_endpoint: Mapped[str] = mapped_column(String, default="")  # blank = AWS default; set for Backblaze B2/other
-    s3_region: Mapped[str] = mapped_column(String, default="")
-    s3_bucket: Mapped[str] = mapped_column(String, default="")
-    s3_prefix: Mapped[str] = mapped_column(String, default="")  # optional folder path within the bucket
-    s3_access_key_id: Mapped[str] = mapped_column(String, default="")
-    s3_secret_access_key_enc: Mapped[str] = mapped_column(Text, default="")
-    # shared
-    cron_frequency: Mapped[str] = mapped_column(String, default="every6h")  # hourly|every6h|daily
-    cron_time: Mapped[str] = mapped_column(String, default="02:00")         # HH:mm (daily only)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
 class Notification(Base):
     __tablename__ = "voice_notifications"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_id)

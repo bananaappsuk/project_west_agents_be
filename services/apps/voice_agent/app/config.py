@@ -5,8 +5,6 @@ class Settings(BaseServiceSettings):
     service_name: str = "voice_agent"
     app_key: str = "voice-agent"  # token audience this service accepts
 
-    encryption_key: str | None = None  # Fernet key for the stored BT Cloud client secret
-
     agent_factory_url: str = "http://localhost:8002"
     agent_factory_internal_key: str | None = None
 
