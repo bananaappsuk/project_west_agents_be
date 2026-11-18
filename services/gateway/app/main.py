@@ -42,6 +42,16 @@ ROUTES: list[tuple[str, str]] = sorted(
         ("/alerts", settings.mail_agent_url),
         ("/settings", settings.mail_agent_url),
         ("/agent/", settings.mail_agent_url),   # /agent/status
+        # The CRM telling the mail agent what a coordinator decided about a
+        # submission. Server-to-server, authenticated by a shared secret
+        # rather than a user token -- the gateway forwards every non-hop-by-hop
+        # header, so X-Callback-Secret reaches the service intact.
+        #
+        # The voice agent's equivalent needs no entry: its router is mounted
+        # under /voice, so /voice/crm-callback is already covered above. This
+        # one has no prefix of its own, and without this line it 404s at the
+        # gateway and every approval silently fails to reach the agent.
+        ("/crm-callback", settings.mail_agent_url),
         ("/voice", settings.voice_agent_url),   # all voice-agent endpoints: /voice/recordings, /voice/settings, …
         ("/agents", settings.agent_factory_url),  # /agents/{app}/{key}/invoke
     ],
