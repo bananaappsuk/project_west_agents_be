@@ -56,3 +56,28 @@ def test_missing_uid_does_not_raise():
     """Capture must never be lost to a CRM detail; an empty id still yields a key."""
     assert len(_idempotency_key("")) == 64
     assert len(_idempotency_key(None)) == 64  # type: ignore[arg-type]
+
+
+def test_the_referral_also_carries_the_raw_id_for_correlation():
+    """The hashed key cannot correlate anything, so the real id travels too.
+
+    The CRM collapses an agent's acting call and its /intake/activity call
+    onto one review item, keyed on (source_system, external_ref). The activity
+    call sends the raw Graph id. If the referral sent only `idempotency_key`,
+    which is a SHA-256 digest, the two would never match: one email would
+    reach a coordinator as two separate decisions, and the deep link back from
+    the CRM would resolve a hash against nothing.
+
+    Asserted on the payload builder rather than by eye, because the two values
+    look interchangeable at a glance and are not.
+    """
+    import inspect
+
+    from app import crm_sync
+
+    source = inspect.getsource(crm_sync.after_email_analysis)
+    assert '"idempotency_key": _idempotency_key(uid)' in source
+    assert '"external_ref": uid' in source
+
+    # And they must genuinely differ, or the test above proves nothing.
+    assert _idempotency_key(UID_A) != UID_A

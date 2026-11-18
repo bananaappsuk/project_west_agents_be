@@ -36,18 +36,33 @@ _SERVICE_TYPES = {
 }
 
 
-def _staged_status(ack: dict) -> str:
-    """How to record what the CRM did with a submission.
+def _submission_outcome(ack: dict, *, created_reference: str | None) -> tuple[str, str | None]:
+    """What the CRM did with a submission, and what to point at afterwards.
 
-    The intake endpoints no longer create anything: they return a review item
-    awaiting a coordinator. Calling that "sent" would claim the CRM holds a
-    referral when all it holds is a request for one, so the wait is named.
-    `applied` is read rather than assumed, so that if the CRM ever starts
-    auto-approving a class of submission this reports it honestly.
+    Three ack shapes, because this agent can outlive a CRM deploy and there is
+    no version handshake between them:
+
+      * `activity_ref` present, `applied` false -- staged, waiting on a
+        coordinator. The review item is the only reference that exists yet.
+      * `applied` true -- the CRM approved it as it arrived. Not something it
+        does today, but reading the flag rather than assuming means an agent
+        would report it honestly if it ever did.
+      * no `activity_ref` at all -- a CRM from before the review gate, which
+        created the record outright and returned its reference.
+
+    That last case is the one worth the function. During a rollout the agents
+    can go out before the CRM, and treating an old ack as "pending_approval"
+    would file a referral that genuinely exists as waiting for an approval
+    nobody will ever be asked for -- with no reference recorded to find it by.
+    Silent, and only visible once somebody wonders why the queue never
+    empties.
     """
+    activity_ref = ack.get("activity_ref")
+    if activity_ref is None:
+        return "sent", created_reference
     if ack.get("applied"):
-        return "sent"
-    return "pending_approval"
+        return "sent", ack.get("applied_reference") or activity_ref
+    return "pending_approval", activity_ref
 
 
 def _children(value) -> list[dict]:
@@ -180,12 +195,12 @@ async def after_call_analysis(recording_payload: dict, analysis: dict) -> tuple[
                 "source_payload": {"call_ext_id": ext_id, "handled_by": agent},
             }
             res = await crm_client.submit_referral(payload)
-            # The CRM holds this for a coordinator; it has not created a
-            # referral and there is no submission reference yet. What comes
-            # back is the review item, which is also what the activity log
-            # below collapses onto.
-            crm_reference = res.get("activity_ref")
-            crm_status = _staged_status(res)
+            # Normally the CRM is holding this for a coordinator and has
+            # created no referral, so the review item is the only reference
+            # there is. `reference` covers a CRM from before the gate.
+            crm_status, crm_reference = _submission_outcome(
+                res, created_reference=res.get("reference")
+            )
             outcome, outcome_reference = "REFERRAL_CREATED", crm_reference
 
         elif intent in _COMMUNICATION_INTENTS:
@@ -214,8 +229,9 @@ async def after_call_analysis(recording_payload: dict, analysis: dict) -> tuple[
                     if analysis.get("preferred_start_at"):
                         payload["preferred_start_at"] = analysis["preferred_start_at"]
                     res = await crm_client.submit_change_request(payload)
-                    crm_status = _staged_status(res)
-                    crm_reference = res.get("activity_ref") or case_ref
+                    crm_status, crm_reference = _submission_outcome(
+                        res, created_reference=case_ref
+                    )
                     outcome = "CHANGE_REQUEST_RAISED"
                     outcome_reference = crm_reference
                 else:
@@ -247,8 +263,9 @@ async def after_call_analysis(recording_payload: dict, analysis: dict) -> tuple[
                     "source_payload": {"handled_by": agent},
                 }
                 res = await crm_client.submit_communication(payload)
-                crm_status = _staged_status(res)
-                crm_reference = res.get("activity_ref") or case_ref
+                crm_status, crm_reference = _submission_outcome(
+                    res, created_reference=case_ref
+                )
                 outcome, outcome_reference = "COMMUNICATION_LOGGED", crm_reference
     except Exception as exc:
         log.warning("CRM submission failed: recording ext_id=%s intent=%s: %s", ext_id, intent, exc)
