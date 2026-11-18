@@ -27,6 +27,14 @@ UNSCOPED_ALLOWED = {
     "/settings/mailbox",        # system config; being removed with the Settings form
     "/settings/mailbox/test",
     "/agent/status",            # run counters, no message content
+    # Server-to-server, from the CRM, authenticated by a shared secret rather
+    # than a user token -- there is no user whose mailboxes could scope it.
+    # It reads one Email row only to set its crm_status from the decision the
+    # CRM has already taken, and returns 204 with no body, so it can neither
+    # disclose a message nor be steered by the caller into touching one it
+    # should not: the external_ref it matches on is one the CRM only knows
+    # because this service sent it.
+    "/crm-callback",
 }
 
 

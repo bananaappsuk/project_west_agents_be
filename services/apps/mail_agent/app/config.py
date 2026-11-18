@@ -27,6 +27,10 @@ class Settings(BaseServiceSettings):
     crm_base_url: str = "http://localhost:8000/api/v1"
     crm_client_id: str = ""
     crm_api_key: str = ""
+    # Shared secret the CRM presents when it tells us a submission was
+    # approved or declined. Blank refuses the callback outright: anything that
+    # can set an email's CRM state must prove it is the CRM.
+    crm_callback_secret: str = ""
 
     # SendGrid — replaces raw SMTP for sending replies on IMAP-provider mailboxes
     # when set (see sendgrid_client.py / pipeline.py's _send_fn_for). Needed on

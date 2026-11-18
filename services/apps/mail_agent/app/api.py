@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
+import hmac
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Response,
+    status,
+)
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +43,92 @@ router = APIRouter()
 
 READ = f"{settings.app_key}:emails.read"
 WRITE = f"{settings.app_key}:emails.write"
+
+
+@router.get("/emails/by-ext/{ext_id:path}")
+async def get_email_by_ext(
+    ext_id: str,
+    claims: dict = Depends(require(READ)),
+    scope: MailboxScope = Depends(mailbox_scope),
+    session: AsyncSession = Depends(get_session),
+):
+    """Find an email by the id its source gave it, rather than ours.
+
+    The CRM only ever learns an email's `uid` (the Graph message id) -- that
+    is what travels on every intake submission as `external_ref`. Our own id
+    never leaves this service, so without this a coordinator reviewing an
+    agent's summary had no way back to the email it came from.
+
+    `:path` because a Graph message id contains characters that would
+    otherwise end the URL segment.
+    """
+    stmt = select(Email).where(
+        Email.uid == ext_id,
+        # Mailbox-scoped like every other route that can reach a message. A
+        # link from the CRM is not an entitlement: a coordinator following one
+        # into a mailbox they cannot read must get the same nothing they would
+        # get anywhere else, and the same 404 either way so the response does
+        # not reveal that the email exists.
+        Email.mailbox_id.in_(scope.readable),
+    )
+    if not scope.safeguarding:
+        stmt = stmt.where(Email.restricted.is_(False))
+
+    e = await session.scalar(stmt)
+    if not e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "email not found")
+    return serialize_email(e)
+
+
+@router.post("/crm-callback", status_code=status.HTTP_204_NO_CONTENT)
+async def crm_callback(
+    body: dict,
+    x_callback_secret: str = Header(default=""),
+    session: AsyncSession = Depends(get_session),
+):
+    """The CRM telling us what a coordinator decided about one submission.
+
+    Since the CRM stopped creating records on submission, "we sent it" and
+    "it exists" are different facts, and only the CRM knows when the second
+    becomes true. Without this the inbox would show every email as awaiting
+    approval for ever.
+
+    Not behind the normal bearer auth: the caller is a server, not a signed-in
+    user. It proves itself with a shared secret, compared with
+    `hmac.compare_digest` so the comparison cannot be timed. An unset secret
+    refuses everything rather than waving callers through -- this endpoint can
+    change what the CRM state of an email says, so an unconfigured deployment
+    must fail closed.
+    """
+    expected = settings.crm_callback_secret
+    if not expected or not hmac.compare_digest(x_callback_secret, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad callback secret")
+
+    ext_id = (body.get("external_ref") or "").strip()
+    if not ext_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "external_ref is required")
+
+    e = await session.scalar(select(Email).where(Email.uid == ext_id))
+    if not e:
+        # Not an error worth retrying: the CRM holds submissions from both
+        # agents and only one of them owns any given external_ref.
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    review_status = (body.get("review_status") or "").upper()
+    if review_status == "APPLIED":
+        e.crm_status = "sent"
+        e.crm_reference = body.get("applied_reference") or e.crm_reference
+    elif review_status == "REJECTED":
+        e.crm_status = "rejected"
+    elif review_status == "APPLY_FAILED":
+        e.crm_status = "failed"
+    else:
+        e.crm_status = "pending_approval"
+
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 
 
 async def _get_email(session: AsyncSession, email_id: str, scope: MailboxScope) -> Email:

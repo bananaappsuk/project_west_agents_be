@@ -55,6 +55,42 @@ _SAFEGUARDING_FLAGS = {
 _REFERRAL_REF_RE = re.compile(r"\bPW-R-\d{4}-\d{3,}\b", re.IGNORECASE)
 
 
+def _staged_status(ack: dict) -> str:
+    """How to record what the CRM did with a submission.
+
+    The intake endpoints no longer create anything: they return a review item
+    awaiting a coordinator. Calling that "sent" would claim the CRM holds a
+    referral when all it holds is a request for one, so the wait is named.
+    `applied` is read rather than assumed, so that if the CRM ever starts
+    auto-approving a class of submission this reports it honestly.
+    """
+    if ack.get("applied"):
+        return "sent"
+    return "pending_approval"
+
+
+def _children(value) -> list[dict]:
+    """Children, with anything the CRM would refuse made safe.
+
+    The CRM requires each child's `age` to be a non-empty string. An email
+    that never mentions ages leaves the LLM with "", and the whole referral
+    used to 422 at the CRM's door -- a real family lost over a field nobody
+    was asked for. The CRM now holds such a referral for a coordinator to
+    complete, but sending a value it has already told us is invalid is still
+    wrong, so an unknown age says so in as many words.
+    """
+    out = []
+    for child in value or []:
+        if not isinstance(child, dict):
+            continue
+        name = (child.get("name") or "").strip()
+        if not name:
+            continue
+        age = str(child.get("age") or "").strip()
+        out.append({"name": name[:120], "age": (age or "unknown")[:20]})
+    return out
+
+
 def _enum_or_none(value: str, allowed: set[str]) -> str | None:
     v = (value or "").strip().upper()
     return v if v in allowed else None
@@ -158,7 +194,10 @@ async def after_email_analysis(
     email_payload: dict, analysis: dict, attachments: list[dict] | None = None
 ) -> tuple[str, str | None, str | None]:
     """Returns (crm_status, crm_reference, activity_ref). crm_status is
-    "none" | "sent" | "skipped" | "failed" — the referral/communication outcome.
+    "none" | "pending_approval" | "sent" | "rejected" | "skipped" | "failed" —
+    the referral/communication outcome. "pending_approval" is the usual result
+    now: the CRM holds the ask until a coordinator approves it, and tells us
+    the outcome on the callback (see api.py).
     activity_ref is the separate POST /intake/activity reference, set whenever
     CRM sync is enabled at all (independent of crm_status).
 
@@ -194,6 +233,12 @@ async def after_email_analysis(
             payload = {
                 "channel": "EMAIL_AGENT",
                 "idempotency_key": _idempotency_key(uid),
+                # The real message id alongside the hashed key. The CRM
+                # collapses this onto the same review item as the activity
+                # call below, which also sends the raw uid, and uses it to
+                # link a coordinator back to the email itself. The hash
+                # could do neither.
+                "external_ref": uid,
                 "referrer_name": analysis.get("referrer_name") or sender,
                 "referrer_email": from_email,
                 "referrer_type": _enum_or_none(analysis.get("referrer_type") or "SELF", _REFERRER_TYPES) or "SELF",
@@ -201,7 +246,7 @@ async def after_email_analysis(
                 "help_needed": analysis.get("help_needed") or subject or "Referral request",
                 # children/attachments are plain (non-nullable) lists on the CRM's schema —
                 # an empty list is the correct "none" value, never a JSON null.
-                "children": analysis.get("children") or [],
+                "children": _children(analysis.get("children")),
                 "child_lives_with": analysis.get("child_lives_with") or None,
                 "requesting_adult_name": analysis.get("requesting_adult_name") or None,
                 "relationship_to_child": analysis.get("relationship_to_child") or None,
@@ -213,8 +258,12 @@ async def after_email_analysis(
                 "attachments": uploaded,
             }
             res = await crm_client.submit_referral(payload)
-            crm_reference = res.get("reference")
-            crm_status = "sent"
+            # The CRM holds this for a coordinator; it has not created a
+            # referral and there is no submission reference yet. What comes
+            # back is the review item, which is also what the activity log
+            # below collapses onto.
+            crm_reference = res.get("activity_ref")
+            crm_status = _staged_status(res)
             outcome, outcome_reference = "REFERRAL_CREATED", crm_reference
 
         elif intent in _COMMUNICATION_INTENTS:
@@ -244,9 +293,10 @@ async def after_email_analysis(
                     if analysis.get("preferred_start_at"):
                         payload["preferred_start_at"] = analysis["preferred_start_at"]
                     res = await crm_client.submit_change_request(payload)
-                    crm_status, crm_reference = "sent", case_ref
+                    crm_status = _staged_status(res)
+                    crm_reference = res.get("activity_ref") or case_ref
                     outcome = "CHANGE_REQUEST_RAISED"
-                    outcome_reference = res.get("change_request_id") or case_ref
+                    outcome_reference = crm_reference
                 else:
                     # Can't identify the session (or even the case) to raise a change
                     # against — rule 3: don't force it through §4, log the contact and
@@ -277,8 +327,9 @@ async def after_email_analysis(
                     "source_payload": {"thread_id": uid},
                 }
                 res = await crm_client.submit_communication(payload)
-                crm_status, crm_reference = "sent", case_ref
-                outcome, outcome_reference = "COMMUNICATION_LOGGED", case_ref
+                crm_status = _staged_status(res)
+                crm_reference = res.get("activity_ref") or case_ref
+                outcome, outcome_reference = "COMMUNICATION_LOGGED", crm_reference
     except Exception as exc:
         log.warning("CRM submission failed: email uid=%s intent=%s: %s", uid, intent, exc)
         crm_status = "failed"

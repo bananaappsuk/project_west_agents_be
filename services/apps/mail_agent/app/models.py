@@ -83,7 +83,11 @@ class Email(Base):
     auto_sent: Mapped[bool] = mapped_column(Boolean, default=False)         # sent by the AI, not a human
     # CRM intake (pw-crm-be) outcome for this email's detected intent, if any.
     intent: Mapped[str] = mapped_column(String, default="NONE")  # REFERRAL|CASE_COMMUNICATION|RESCHEDULE|CANCEL|NONE
-    crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
+    # none|pending_approval|sent|rejected|skipped|failed
+    #   pending_approval -- the CRM is holding it for a coordinator
+    #   sent             -- a coordinator approved it and the record exists
+    #   rejected         -- a coordinator declined it; nothing was created
+    crm_status: Mapped[str] = mapped_column(String, default="none")
     crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref
     # POST /intake/activity's own reference (e.g. "PW-A-2026-0009") — a separate
     # cross-referencing log entry sent for every email regardless of crm_status,

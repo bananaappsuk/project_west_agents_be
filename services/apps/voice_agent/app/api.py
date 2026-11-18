@@ -4,7 +4,21 @@ import logging
 import uuid
 from datetime import date, timedelta
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+import hmac
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -239,6 +253,81 @@ async def upload_recording(
     session.add(row)
     await session.commit()
     return serialize_recording(row)
+
+
+@router.post("/crm-callback", status_code=status.HTTP_204_NO_CONTENT)
+async def crm_callback(
+    body: dict,
+    x_callback_secret: str = Header(default=""),
+    session: AsyncSession = Depends(get_session),
+):
+    """The CRM telling us what a coordinator decided about one submission.
+
+    Since the CRM stopped creating records on submission, "we sent it" and
+    "it exists" are different facts, and only the CRM knows when the second
+    becomes true. Without this the dashboard would show every call as
+    awaiting approval for ever.
+
+    Not behind the normal bearer auth: the caller is a server, not a signed-in
+    user. It proves itself with a shared secret, compared with
+    `hmac.compare_digest` so the comparison cannot be timed. An unset secret
+    refuses everything rather than waving callers through -- this endpoint can
+    change what the CRM state of a call says, so an unconfigured deployment
+    must fail closed.
+    """
+    expected = settings.crm_callback_secret
+    if not expected or not hmac.compare_digest(x_callback_secret, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad callback secret")
+
+    ext_id = (body.get("external_ref") or "").strip()
+    if not ext_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "external_ref is required")
+
+    r = await session.scalar(select(Recording).where(Recording.ext_id == ext_id))
+    if not r:
+        # Not an error worth retrying: the CRM holds submissions from both
+        # agents and only one of them owns any given ext_id.
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    review_status = (body.get("review_status") or "").upper()
+    if review_status == "APPLIED":
+        r.crm_status = "sent"
+        r.crm_reference = body.get("applied_reference") or r.crm_reference
+    elif review_status == "REJECTED":
+        r.crm_status = "rejected"
+    elif review_status in ("APPLY_FAILED",):
+        r.crm_status = "failed"
+    else:
+        r.crm_status = "pending_approval"
+
+    await session.commit()
+    log.info("crm callback ext_id=%s -> %s", ext_id, r.crm_status)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/recordings/by-ext/{ext_id:path}")
+async def get_recording_by_ext(
+    ext_id: str,
+    claims: dict = Depends(require(READ)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Find a call by the id its source gave it, rather than ours.
+
+    The CRM only ever learns a recording's `ext_id` -- that is what travels on
+    every intake submission as `external_ref`. Our own uuid never leaves this
+    service, so without this a coordinator reviewing an agent's summary had no
+    way back to the call it came from.
+
+    Declared above GET /recordings/{rec_id}: that route would otherwise match
+    "by-ext" as a recording id and 404 every link.
+
+    `:path` because a BT Cloud ext_id can contain characters that would
+    otherwise end the segment.
+    """
+    r = await session.scalar(select(Recording).where(Recording.ext_id == ext_id))
+    if not r:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "recording not found")
+    return serialize_recording(r)
 
 
 @router.get("/recordings/{rec_id}")

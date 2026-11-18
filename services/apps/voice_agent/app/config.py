@@ -55,6 +55,10 @@ class Settings(BaseServiceSettings):
     crm_base_url: str = "http://localhost:8000/api/v1"
     crm_client_id: str = ""
     crm_api_key: str = ""
+    # Shared secret the CRM presents when it tells us a submission was
+    # approved or declined. Blank means the callback is refused outright:
+    # anything that can set a recording's CRM state must prove it is the CRM.
+    crm_callback_secret: str = ""
 
 
 settings = Settings()

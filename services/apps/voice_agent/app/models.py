@@ -78,7 +78,11 @@ class Recording(Base):
     # is what it is, not just the bare outcome.
     intent: Mapped[str] = mapped_column(String, default="NONE")  # NONE|REFERRAL|CASE_COMMUNICATION|RESCHEDULE|CANCEL
     # CRM intake (pw-crm-be) outcome for this call's detected intent, if any.
-    crm_status: Mapped[str] = mapped_column(String, default="none")        # none|sent|skipped|failed
+    # none|pending_approval|sent|rejected|skipped|failed
+    #   pending_approval -- the CRM is holding it for a coordinator
+    #   sent             -- a coordinator approved it and the record exists
+    #   rejected         -- a coordinator declined it; nothing was created
+    crm_status: Mapped[str] = mapped_column(String, default="none")
     crm_reference: Mapped[str | None] = mapped_column(String, nullable=True)  # PW-R-... referral ref, or the case_ref
     # POST /intake/activity's own reference (e.g. "PW-A-2026-0009") — a separate
     # cross-referencing log entry sent for every call regardless of crm_status,
