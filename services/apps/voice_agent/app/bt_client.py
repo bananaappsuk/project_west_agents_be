@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .transcribe import transcribe
+from .transcribe import transcribe_detailed
 
 log = logging.getLogger("voice_agent.bt_client")
 
@@ -232,7 +232,12 @@ def transcribe_one(item: dict, *, endpoint: str, client_id: str, client_secret: 
             server, client_id, client_secret, jwt,
             lambda token: _download_recording(token, content_uri),
         )
-        return transcribe(audio, ctype) or "(no transcript available)"
+        # Segments ride back on the item: the pipeline already carries each call
+        # through as this dict, and this keeps the return value a plain string
+        # for every existing caller.
+        text, segments = transcribe_detailed(audio, ctype)
+        item["transcript_segments"] = segments
+        return text or "(no transcript available)"
     except Exception as exc:
         log.warning("download/transcribe failed for call %s: %s", item.get("ext_id"), exc)
         return "(no transcript available)"

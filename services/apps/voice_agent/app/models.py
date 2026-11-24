@@ -15,6 +15,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -50,6 +51,11 @@ class Recording(Base):
     # Null for S3/upload sources (their `ext_id` already doubles as the storage key) and for
     # recordings synced before this column existed.
     content_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The transcript split by speaker: [{speaker, role, start, end, text}, ...].
+    # Display only. `transcript` stays the record -- these segments come from a
+    # second pass and exist to make a call readable, not to restate it. NULL for
+    # calls transcribed before speaker labelling, or where it failed.
+    transcript_segments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # AI fields (filled by the Agent Factory voice agent)
     summary: Mapped[str] = mapped_column(Text, default="")
     # One code from the controlled PW taxonomy (agent_factory/app/taxonomy.py,

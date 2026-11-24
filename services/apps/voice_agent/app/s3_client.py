@@ -21,7 +21,7 @@ import logging
 import boto3
 from botocore.config import Config as BotoConfig
 
-from .transcribe import transcribe
+from .transcribe import transcribe_detailed
 
 log = logging.getLogger("voice_agent.s3_client")
 
@@ -125,7 +125,9 @@ def transcribe_one(
         obj = client.get_object(Bucket=bucket, Key=key)
         content_type = obj.get("ContentType") or "audio/mpeg"
         body = obj["Body"].read()
-        return transcribe(body, content_type) or "(no transcript available)"
+        text, segments = transcribe_detailed(body, content_type)
+        item["transcript_segments"] = segments
+        return text or "(no transcript available)"
     except Exception as exc:
         log.warning("download/transcribe failed for object %s: %s", key, exc)
         return "(no transcript available)"

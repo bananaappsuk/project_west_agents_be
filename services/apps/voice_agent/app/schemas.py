@@ -60,6 +60,9 @@ def serialize_recording(r: Recording) -> dict:
         "replyStatus": r.reply_status,
         "summary": r.summary,
         "transcript": r.transcript,
+        # Null where speaker labelling was off, failed, or predates it; the UI then
+        # shows the plain transcript, which is the record either way.
+        "transcriptSegments": r.transcript_segments,
         "aiReply": r.ai_reply,
         "analysisStatus": r.analysis_status,
         "intent": r.intent,

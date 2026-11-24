@@ -202,7 +202,7 @@ async def upload_recording(
     discard-after-transcribe policy, so BT-Cloud-style recordings with no playback."""
     audio = await file.read()
     content_type = file.content_type or "audio/mpeg"
-    transcript = await run_in_threadpool(transcribe.transcribe, audio, content_type)
+    transcript, segments = await run_in_threadpool(transcribe.transcribe_detailed, audio, content_type)
 
     source_type, ext_id = "upload", str(uuid.uuid4())
     if save_audio:
@@ -242,6 +242,7 @@ async def upload_recording(
         caller=caller, phone="", agent="Uploaded",
         call_date=date.today().isoformat(), duration="",
         transcript=transcript or "(no transcript available)",
+        transcript_segments=segments,
         summary=a.get("summary", ""), category=a.get("category") or "unclassified",
         flags=list(a.get("flags") or []),
         route=a.get("route") or "exception",
@@ -415,10 +416,13 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
         transcript = r.transcript
         if not transcript or transcript == "(no transcript available)":
             audio, content_type = await _fetch_recording_audio(r)
-            transcript = await run_in_threadpool(transcribe.transcribe, audio, content_type)
+            transcript, segments = await run_in_threadpool(
+                transcribe.transcribe_detailed, audio, content_type
+            )
             if not transcript:
                 raise HTTPException(status.HTTP_502_BAD_GATEWAY, "transcription returned no text for this recording")
             r.transcript = transcript
+            r.transcript_segments = segments
 
         r.analysis_status = "pending"
         await session.commit()

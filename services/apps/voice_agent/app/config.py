@@ -49,6 +49,18 @@ class Settings(BaseServiceSettings):
     openai_api_key: str | None = None
     transcribe_model: str = "whisper-1"
 
+    # Who-said-what. The words still come from `transcribe_model`, which hears names
+    # far better; a second, speaker-aware model supplies only who spoke when, and the
+    # two are lined up by timestamp. Tested on real calls: the speaker model alone
+    # dropped a caller's name and turned a child's name into "80". Off switch here
+    # because it roughly doubles transcription cost and adds 20-80s per call.
+    speaker_labels_enabled: bool = True
+    diarize_model: str = "gpt-4o-transcribe-diarize"
+    # Reads the opening lines and says which speaker is the recorded notice, which
+    # is Project West and which is the family. Small, cheap, and allowed to say
+    # "not sure" -- an unlabelled speaker is better than a wrong one.
+    speaker_label_model: str = "gpt-4o-mini"
+
     # CRM intake (pw-crm-be) — referrals, case communications, session change requests.
     # Off by default so environments without real CRM credentials never call out.
     crm_enabled: bool = False

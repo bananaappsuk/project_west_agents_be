@@ -200,6 +200,7 @@ async def _run(count: int, sweep: bool, run_id: str) -> list[str]:
                 ext_id=m["ext_id"], source_type=source_type, caller=m["caller"], phone=m["phone"],
                 agent=m["agent"], call_date=m["date"], duration=m["duration"],
                 transcript=m["transcript"], content_uri=m.get("content_uri"),
+                transcript_segments=m.get("transcript_segments"),
                 status="new", analysis_status="pending",
             )
             s.add(row)
