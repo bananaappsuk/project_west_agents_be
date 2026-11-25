@@ -23,7 +23,11 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import agent_client, bt_client, crm_sync, pipeline, s3_client, source_config, transcribe
+# crm_sync is deliberately absent: `voice.submit_to_crm` inside the workflow
+# is the only CRM submission path in this service (AC-5, E-2). agent_client
+# stays for POST /recordings/upload, which analyses an uploaded file and --
+# as it always has -- does not submit it to the CRM.
+from . import agent_client, bt_client, pipeline, s3_client, source_config, transcribe
 from .config import settings
 from .db import get_session
 from .deps import require
@@ -431,32 +435,51 @@ async def retry_analysis(rec_id: str, claims: dict = Depends(require(WRITE)), se
             "ext_id": r.ext_id, "call_date": r.call_date, "caller": r.caller,
             "phone": r.phone, "agent": r.agent, "duration": r.duration, "transcript": transcript,
         }
-        try:
-            res = await agent_client.analyze_call(payload)
-            a = res.get("analysis") or {}
-            ok = True
-        except Exception as exc:
-            log.warning("retry-analysis FAILED rec=%s: %s", rec_id, exc)
-            a, ok = {}, False
+        # The analysis and the CRM submission both happen inside the workflow
+        # now (Ticket 3 AC-5). This endpoint no longer calls the Agent Factory
+        # and no longer calls `crm_sync`: `voice.submit_to_crm` is the only
+        # submission path in the service, which is what E-2 asks for.
+        #
+        # The response shape is unchanged -- `serialize_recording` of the row the
+        # workflow persisted -- so the review UI needs no change. The 409 above
+        # is unchanged too.
+        #
+        # `start_retry` allocates a *distinct* run for this deliberate retry,
+        # under a transaction-scoped advisory lock, so two people pressing the
+        # button at once produce one run and one refusal rather than two
+        # submissions (Q-2).
+        from .orchestration import (
+            ALREADY_RUNNING,
+            principal_from_claims,
+            RecordingAuthorizationPort,
+            build_orchestrator,
+            start_retry,
+        )
+        from platform_orchestration import WorkflowState
 
-        if ok:
-            crm_status, crm_ref, activity_ref = await crm_sync.after_call_analysis(payload, a)
-            r.summary = a.get("summary", "")
-            r.category = a.get("category") or "unclassified"
-            r.flags = list(a.get("flags") or [])
-            r.route = a.get("route") or "exception"
-            r.priority = a.get("priority", "Medium")
-            r.risk = a.get("risk", "Low")
-            r.sentiment = a.get("sentiment", "Neutral")
-            r.needs_reply = bool(a.get("needs_reply", False))
-            r.ai_reply = a.get("suggested_reply", "") or ""
-            r.reply_status = "pending" if r.needs_reply else "none"
-            r.analysis_status = "done"
-            r.intent = a.get("intent") or "NONE"
-            r.crm_status, r.crm_reference, r.activity_ref = crm_status, crm_ref, activity_ref
-        else:
-            r.analysis_status = "failed"
+        # The commit here is what makes a re-fetched transcript durable before
+        # the workflow reads the row back.
         await session.commit()
+
+        orchestrator = build_orchestrator(
+            RecordingAuthorizationPort(settings.app_key)
+        )
+        outcome = await start_retry(
+            orchestrator, rec_id, principal=principal_from_claims(claims)
+        )
+        if outcome is ALREADY_RUNNING:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "this recording is already being analyzed",
+            )
+        run = await orchestrator.run_to_completion(
+            outcome.id, principal=principal_from_claims(claims)
+        )
+        if run.state is not WorkflowState.SUCCEEDED:
+            log.warning(
+                "retry-analysis workflow %s ended %s: %s",
+                run.id, run.state.value, run.last_error,
+            )
 
         await session.refresh(r)
         return serialize_recording(r)

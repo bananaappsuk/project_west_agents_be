@@ -72,5 +72,19 @@ class Settings(BaseServiceSettings):
     # anything that can set a recording's CRM state must prove it is the CRM.
     crm_callback_secret: str = ""
 
+    # ── Shared orchestration (Ticket 3 AC-5) ─────────────────────────────────
+    # No setting. The orchestration workflow is not optional: `voice.intake` is
+    # the only path from a recording to the CRM, and a switch that bypassed it
+    # would be a second submission path -- which is the thing AC-5's E-2 exists
+    # to rule out.
+    #
+    # A shadow flag lived here while the evidence was being gathered. It is gone
+    # rather than retained for diagnostics: it gated nothing after the cutover,
+    # and configuration that looks like a control but is not is worse than none.
+    #
+    # The deployment control is `CRON_ENABLED=false`, which already exists above.
+    # It pauses the scheduler, so nothing is fetched, analysed or submitted --
+    # a pause, not a bypass, and it needs no new code.
+
 
 settings = Settings()

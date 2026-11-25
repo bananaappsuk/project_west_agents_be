@@ -15,7 +15,11 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 
-from . import agent_client, bt_client, crm_sync, s3_client, source_config
+# agent_client and crm_sync are deliberately absent: the workflow is the only
+# caller of either, and an import here would be the first step back towards a
+# second submission path (AC-5, E-2).
+from . import bt_client, s3_client, source_config
+from .config import settings
 from .db import SessionLocal
 from .models import AgentRun, Notification, Recording
 
@@ -103,6 +107,79 @@ async def fetch_and_process(count: int, *, sweep: bool = False) -> list[str]:
         raise
     finally:
         _running = False
+
+
+_ORCHESTRATOR = None
+
+
+def _orchestrator():
+    """The service's orchestrator, built once.
+
+    Cached because `build_orchestrator` assembles a handler registry and
+    validates every definition, and a batch of twelve recordings would otherwise
+    do that twelve times per tick.
+    """
+    global _ORCHESTRATOR
+    if _ORCHESTRATOR is None:
+        from .orchestration import RecordingAuthorizationPort, build_orchestrator
+
+        _ORCHESTRATOR = build_orchestrator(
+            RecordingAuthorizationPort(settings.app_key)
+        )
+    return _ORCHESTRATOR
+
+
+async def _process_via_workflow(rec_id: str) -> bool:
+    """Analyse one recording and forward it to the CRM, through the workflow.
+
+    This is the only path from a recording to the CRM. `voice.submit_to_crm`
+    lives inside `voice.process_intake`, and `crm_sync` has no other caller in
+    application code -- which is AC-5's E-2, and is asserted by a test.
+
+    Returns whether the recording ended up analysed, which is all `_run` needs
+    to compute this batch's counts.
+
+    Never raises. The pipeline's standing rule is that a downstream failure
+    costs that row's status and nothing else, so a workflow that cannot start
+    or cannot finish leaves `analysis_status` for the caller to mark and the
+    rest of the batch unaffected.
+
+    Safe to call twice over one recording: the idempotency key is the recording
+    id, so a second call returns the run that already exists rather than
+    submitting again. If that run is still in flight, this returns its current
+    outcome rather than waiting on it.
+    """
+    from .orchestration import INTAKE, start_intake
+    from platform_orchestration import SYSTEM_PRINCIPAL, WorkflowState
+
+    try:
+        orchestrator = _orchestrator()
+        run = await start_intake(
+            orchestrator, rec_id, principal=SYSTEM_PRINCIPAL,
+        )
+        if run.state in (WorkflowState.SUCCEEDED,):
+            # An earlier tick already completed it; nothing more to do, and in
+            # particular nothing to re-submit.
+            log.info("workflow for %s already complete", rec_id)
+            return True
+        run = await orchestrator.run_to_completion(
+            run.id, principal=SYSTEM_PRINCIPAL
+        )
+        if run.state is WorkflowState.SUCCEEDED:
+            return True
+        log.warning(
+            "workflow %s for %s ended %s: %s",
+            run.id, rec_id, run.state.value, run.last_error,
+        )
+        # A run that is waiting on a retry has not failed: the scheduler's
+        # resume will carry it on, and marking the row "failed" now would hide
+        # it from the retry it is already queued for.
+        return run.state in (WorkflowState.RETRY_SCHEDULED,)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "workflow could not process %s: %s", rec_id, type(exc).__name__
+        )
+        return False
 
 
 async def _run(count: int, sweep: bool, run_id: str) -> list[str]:
@@ -244,57 +321,59 @@ async def _run(count: int, sweep: bool, run_id: str) -> list[str]:
     to_analyze = [(rid, p) for rid, p in new if try_claim_analyzing(rid)]
     claimed = [rid for rid, _ in to_analyze]
 
-    async def analyze(rec_id: str, payload: dict):
+    # Analysis and CRM submission both happen inside the orchestration workflow
+    # now (Ticket 3 AC-5). This function no longer calls the Agent Factory and no
+    # longer calls `crm_sync`: `voice.submit_to_crm` is the single submission
+    # path, which is what AC-5's E-2 asks for and what makes the approval gate,
+    # the retry policy, the lease and the audit trail apply to every submission
+    # rather than only to the ones that happen to go through a workflow.
+    #
+    # What has NOT changed, deliberately:
+    #
+    #   * the `_analyzing` claim above still skips a recording a manual retry is
+    #     already working on, so the two cannot race each other in-process;
+    #   * the workflow is started with the recording id as its idempotency key,
+    #     so a second tick over the same row returns the existing run;
+    #   * `AgentRun`'s counts are still computed here, from the rows the workflow
+    #     persisted, so the dashboard reads exactly as it did;
+    #   * the stuck-pending re-queue above is untouched.
+    #
+    # A slow CRM call still holds no database connection: the workflow's own
+    # steps open and close their own sessions, and nothing here is inside the
+    # persist transaction below.
+    async def process(rec_id: str):
         async with sem:
-            try:
-                res = await agent_client.analyze_call(payload)
-                return rec_id, (res.get("analysis") or {}), True
-            except Exception as exc:
-                log.warning("analysis FAILED rec=%s: %s", rec_id, exc)
-                return rec_id, {}, False
+            return rec_id, await _process_via_workflow(rec_id)
 
     try:
-        results = await asyncio.gather(*(analyze(rid, p) for rid, p in to_analyze))
+        outcomes = await asyncio.gather(*(process(rid) for rid, _ in to_analyze))
+        results = [(rec_id, {}, ok) for rec_id, ok in outcomes]
 
-        # CRM forwarding — also NO DB connection held, same principle as analyze
-        # above. A referral/communication submission is an HTTP call that can take
-        # seconds; running it here rather than inside the persist transaction below
-        # means a slow or failing CRM call can never hold a pooled connection open
-        # or roll back rows that already finished processing.
-        async def do_crm(rec_id: str, a: dict, ok: bool) -> tuple[str, str, str | None, str | None]:
-            if not ok:
-                return rec_id, "none", None, None
-            async with sem:
-                status, ref, activity_ref = await crm_sync.after_call_analysis(payload_by_id[rec_id], a)
-                return rec_id, status, ref, activity_ref
-
-        crm_results = await asyncio.gather(*(do_crm(rid, a, ok) for rid, a, ok in results))
-        crm_by_id = {rid: (status, ref, activity_ref) for rid, status, ref, activity_ref in crm_results}
-
-        # 5) short txn: persist analysis + record the run + notification
+        # 5) short txn: mark a failed analysis, record the run, notify.
+        #
+        # The analysis fields and the CRM outcome are no longer written here --
+        # `voice.process_intake` persisted them inside the workflow, in one
+        # transaction, exactly as this block used to. What is left is the two
+        # things the workflow does not know about: this batch's `AgentRun`
+        # counts, and the notification.
+        #
+        # `high_risk` is therefore read back from the rows rather than counted
+        # from an in-memory analysis. Same number, one query, and it stays
+        # correct if a workflow retried and changed the risk on a later attempt.
         high = 0
         async with SessionLocal() as s:
-            for rec_id, a, ok in results:
+            for rec_id, _a, ok in results:
                 r = await s.get(Recording, rec_id)
                 if not r:
                     continue
                 if ok:
-                    r.summary = a.get("summary", "")
-                    r.category = a.get("category") or "unclassified"
-                    r.flags = list(a.get("flags") or [])
-                    r.route = a.get("route") or "exception"
-                    r.priority = a.get("priority", "Medium")
-                    r.risk = a.get("risk", "Low")
-                    r.sentiment = a.get("sentiment", "Neutral")
-                    r.needs_reply = bool(a.get("needs_reply", False))
-                    r.ai_reply = a.get("suggested_reply", "") or ""
-                    r.reply_status = "pending" if r.needs_reply else "none"
-                    r.analysis_status = "done"
                     if r.risk == "High":
                         high += 1
-                    r.intent = a.get("intent") or "NONE"
-                    r.crm_status, r.crm_reference, r.activity_ref = crm_by_id.get(rec_id, ("none", None, None))
                 else:
+                    # The workflow could not analyse it. Marked here rather than
+                    # in the handler so a run that never got as far as running --
+                    # refused authorization, say -- still leaves the row in a
+                    # state the next sweep can see.
                     r.analysis_status = "failed"
             all_ok = all(ok for _, _, ok in results)
             run = await s.get(AgentRun, run_id)

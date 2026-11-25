@@ -35,6 +35,7 @@ BACKEND = Path(__file__).resolve().parent.parent
 VENDORED: dict[str, tuple[str, ...]] = {
     "platform_orchestration": (
         "services/apps/mail_agent",
+        "services/apps/voice_agent",
     ),
 }
 

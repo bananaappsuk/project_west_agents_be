@@ -9,6 +9,8 @@ from platform_common import configure_logging
 configure_logging("voice_agent")
 log = logging.getLogger("voice_agent")
 
+from platform_orchestration.models import Base as OrchestrationBase  # noqa: E402
+
 from . import api, scheduler  # noqa: E402  (import after logging is configured)
 from .db import engine
 from .models import Base
@@ -20,6 +22,12 @@ async def _init_db(retries: int = 6, delay: float = 2.0) -> None:
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+                # The shared orchestration tables live in this service's own
+                # database, on their own metadata -- the library does not reach
+                # into this service's declarative base, so `Base.metadata`
+                # above does not cover them. Created here alongside everything
+                # else, matching the mail agent's arrangement exactly.
+                await conn.run_sync(OrchestrationBase.metadata.create_all)
             return
         except Exception as exc:
             log.warning("DB connect attempt %d/%d failed: %s", attempt, retries, exc)
